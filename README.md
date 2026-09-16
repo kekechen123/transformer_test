@@ -37,6 +37,8 @@ python translate.py --data parallel.tsv --limit 5000 --epochs 2 --out runs/quick
 
 ```bash
 python translate.py --data parallel.tsv
+
+or python translate.py --data parallel.tsv --limit 200000 --out runs/zh_en_200k
 ```
 
 默认配置是编码器 3 层、解码器 3 层，隐藏维度 256、4 个注意力头、前馈维度 512、8000 子词词表、最大长度 96、batch 64。参数量约 8 百万，CUDA 上启用 FP16 混合精度，面向 4060 级别显卡。显存消耗还取决于句长与软件环境；如果显存不足，加 `--batch-size 32` 或 `--batch-size 16`。
