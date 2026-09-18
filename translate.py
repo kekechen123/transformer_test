@@ -153,7 +153,7 @@ def translate(model, sp, sentence, device):
 
 
 # 4. 一轮训练/验证：Teacher Forcing，用真实前缀预测下一个真实词。
-def run_epoch(model, loader, optimizer, scaler, device):
+def run_epoch(model, loader, optimizer, scaler, device, scheduler=None):
     # optimizer 不为空表示训练；传 None 表示验证。
     # 训练和验证使用同一套前向/损失计算，但验证不反向传播、不更新参数。
     training = optimizer is not None
@@ -190,6 +190,9 @@ def run_epoch(model, loader, optimizer, scaler, device):
                 # 根据梯度更新参数，然后更新混合精度的缩放因子。
                 scaler.step(optimizer)
                 scaler.update()
+                if scheduler is not None:
+                    # 按 batch（step）更新学习率，而不是等到 epoch 结束。
+                    scheduler.step()
         # 只统计真实 token，不统计补齐用的 PAD；loss 也使用了相同规则。
         tokens = labels.ne(PAD).sum().item()
         total_loss += loss.item() * tokens
@@ -214,6 +217,10 @@ def main():
     p.add_argument("--d-model", type=int, default=256)
     p.add_argument("--layers", type=int, default=3, help="编码器、解码器各自的层数")
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr-warmup", action="store_true",
+                   help="启用按 step 线性 warmup，达到 --lr 后再余弦衰减")
+    p.add_argument("--warmup-ratio", type=float, default=0.1,
+                   help="warmup 占总训练 step 的比例（默认 0.1）")
     args = p.parse_args()
     random.seed(42)
     torch.manual_seed(42)
@@ -234,8 +241,10 @@ def main():
         return
 
     if (args.d_model < 4 or args.d_model % 4 or args.layers < 1 or args.max_len < 4
-            or args.batch_size < 1 or args.epochs < 1 or args.limit < 0 or args.lr <= 0):
-        p.error("d-model 须为 4 的正倍数；layers/batch-size/epochs/lr > 0；max-len ≥ 4；limit ≥ 0")
+            or args.batch_size < 1 or args.epochs < 1 or args.limit < 0 or args.lr <= 0
+            or not 0 < args.warmup_ratio < 1):
+        p.error("d-model 须为 4 的正倍数；layers/batch-size/epochs/lr > 0；"
+                "max-len ≥ 4；limit ≥ 0；warmup-ratio 须在 0 和 1 之间")
     # 每次实验单独保存，避免新词表覆盖旧模型所依赖的词表。
     # Transformer 的参数和 tokenizer 必须配套，否则同一个 id 可能代表不同子词。
     out.mkdir(parents=True, exist_ok=True)
@@ -276,6 +285,22 @@ def main():
     model = Translator(**config).to(device)
     # AdamW 是常用的优化器：它根据梯度调整模型参数，使 loss 逐步下降。
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    scheduler = None
+    if args.lr_warmup:
+        total_steps = args.epochs * len(train_loader)
+        warmup_steps = max(1, round(total_steps * args.warmup_ratio))
+
+        def lr_scale(step):
+            # 先线性升到 --lr，再用 cosine 平滑降到 0。
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps
+            decay_steps = max(1, total_steps - warmup_steps)
+            progress = min(1.0, (step - warmup_steps) / decay_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
+        print(f"学习率：warmup {warmup_steps}/{total_steps} steps "
+              f"({args.warmup_ratio:.0%}) → 峰值 {args.lr:g} → cosine decay", flush=True)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     direction = "英 → 中" if args.reverse else "中 → 英"
     print(f"{direction} | 训练 {len(train_data)} / 验证 {len(valid_data)} 句对 | "
@@ -288,7 +313,7 @@ def main():
         for epoch in range(1, args.epochs + 1):
             start = time.perf_counter()
             # 一轮（epoch）就是把整个训练集完整看一遍。
-            train_loss = run_epoch(model, train_loader, optimizer, scaler, device)
+            train_loss = run_epoch(model, train_loader, optimizer, scaler, device, scheduler)
             # optimizer=None，因此这一轮只评估，不更新模型。
             valid_loss = run_epoch(model, valid_loader, None, scaler, device)
             seconds = time.perf_counter() - start
@@ -302,10 +327,19 @@ def main():
                 best = valid_loss
                 torch.save({"model": model.state_dict(), "config": config,
                             "direction": direction}, out / "best.pt")
-            for src_ids, tgt_ids in valid_data[:3]:
-                source, reference = sp.decode(src_ids[1:-1]), sp.decode(tgt_ids[1:-1])
-                print(f"  原文：{source}\n  参考：{reference}\n"
-                      f"  预测：{translate(model, sp, source, device)}", flush=True)
+            # 每轮只抽一条，并明确在 CPU 上推理，顺便观察单条翻译耗时。
+            src_ids, tgt_ids = valid_data[0]
+            source, reference = sp.decode(src_ids[1:-1]), sp.decode(tgt_ids[1:-1])
+            cpu = torch.device("cpu")
+            model.to(cpu)
+            try:
+                infer_start = time.perf_counter()
+                prediction = translate(model, sp, source, cpu)
+                infer_seconds = time.perf_counter() - infer_start
+            finally:
+                model.to(device)
+            print(f"  CPU 推理 {infer_seconds * 1000:.1f}ms\n  原文：{source}\n"
+                  f"  参考：{reference}\n  预测：{prediction}", flush=True)
     print(f"完成！最佳验证 loss={best:.3f}，模型保存在 {out / 'best.pt'}")
 
 
