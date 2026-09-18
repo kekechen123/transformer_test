@@ -90,3 +90,14 @@ python translate.py --out runs/en_zh --text "I like learning."
 
 为便于阅读，这里采用固定学习率 AdamW 和贪心解码，没有实现原论文的学习率日程、beam search、BLEU 或断点续训。架构是标准 Encoder–Decoder Transformer，训练配方是简化学习版。保存的是推理权重，重新运行训练会从头开始。
 
+python translate.py \
+--data parallel.tsv \
+--limit 600000 \
+--epochs 30 \
+--batch-size 64 \
+--d-model 512 \
+--layers 6 \
+--lr 3e-4 \
+--lr-warmup \
+--warmup-ratio 0.1 \
+--out runs/test_warmup
