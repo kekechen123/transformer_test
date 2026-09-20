@@ -265,6 +265,11 @@ def main():
         hard_vocab_limit=False, minloglevel=2,
     )
     sp = spm.SentencePieceProcessor(model_file=str(out / "tokenizer.model"))
+    cpu_test_sentences = [line.strip() for line in Path(
+        "/home/evrenchen/daily_work/transformer_test/test_data/test_data/test.md"
+    ).read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not cpu_test_sentences:
+        p.error("CPU 测试文本为空")
 
     def prepare(raw):
         # 把字符串句对转换成 token id 句对，供 DataLoader 和模型使用。
@@ -327,19 +332,19 @@ def main():
                 best = valid_loss
                 torch.save({"model": model.state_dict(), "config": config,
                             "direction": direction}, out / "best.pt")
-            # 每轮只抽一条，并明确在 CPU 上推理，顺便观察单条翻译耗时。
-            src_ids, tgt_ids = valid_data[0]
-            source, reference = sp.decode(src_ids[1:-1]), sp.decode(tgt_ids[1:-1])
-            cpu = torch.device("cpu")
-            model.to(cpu)
-            try:
-                infer_start = time.perf_counter()
-                prediction = translate(model, sp, source, cpu)
-                infer_seconds = time.perf_counter() - infer_start
-            finally:
-                model.to(device)
-            print(f"  CPU 推理 {infer_seconds * 1000:.1f}ms\n  原文：{source}\n"
-                  f"  参考：{reference}\n  预测：{prediction}", flush=True)
+            # 每五轮读取 test.md 中的全部句子，并明确在 CPU 上推理。
+            if epoch % 5 == 0:
+                cpu = torch.device("cpu")
+                model.to(cpu)
+                try:
+                    for source in cpu_test_sentences:
+                        infer_start = time.perf_counter()
+                        prediction = translate(model, sp, source, cpu)
+                        infer_seconds = time.perf_counter() - infer_start
+                        print(f"  CPU 推理 {infer_seconds * 1000:.1f}ms\n  原文：{source}\n"
+                              f"  预测：{prediction}", flush=True)
+                finally:
+                    model.to(device)
     print(f"完成！最佳验证 loss={best:.3f}，模型保存在 {out / 'best.pt'}")
 
 
