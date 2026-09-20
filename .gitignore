@@ -1,2 +1,3 @@
 *.tsv
 tmp
+test_data/__pycache__/

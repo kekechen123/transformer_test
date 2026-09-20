@@ -16,9 +16,11 @@ EXPERIMENTS = [
      "train 降至约 1.1，valid loss 在 1.5 附近震荡，泛化性缺失"),
     ("testE", "test_e_loss.csv", "600k", "1e-4", 64, 512, 6,
      "loss 到 2 左右后下降变慢，可能需要更长训练或调整学习率"),
+    ("testF", "test_f_loss.csv", "600k", "3e-4", 64, 512, 6,
+     "加入 lr warmup（warmup ratio 0.1）后 valid loss 稳定下降到约 1.39"),
 ]
 COLORS = {"testA": "#2563eb", "testB": "#dc2626", "testC": "#9333ea",
-          "testD": "#059669", "testE": "#ea580c"}
+          "testD": "#059669", "testE": "#ea580c", "testF": "#0891b2"}
 
 
 def load_data(filename):
@@ -51,7 +53,7 @@ def write_summary(rows):
     lines = [
         "# Transformer 实验结果汇总",
         "",
-        "仅纳入已有 CSV 结果的 testA–testE；testF 尚未开始，未纳入表格和图。",
+        "纳入已有 CSV 结果的 testA–testF。",
         "",
         "| 实验 | 数据量 | d-model | layers | lr | batch-size | epochs | train 首/末 | valid 最优 | valid 末轮 | 平均每 epoch(s) |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -105,8 +107,8 @@ def chart():
         '<svg xmlns="http://www.w3.org/2000/svg" width="1700" height="930" viewBox="0 0 1700 930">',
         '<rect width="100%" height="100%" fill="#f8fafc"/>',
         '<style>text{font-family:Arial,"Noto Sans SC",sans-serif;fill:#0f172a}.title{font-size:30px;font-weight:700}.subtitle{font-size:15px;fill:#64748b}.panel{font-size:20px;font-weight:700}.axis{font-size:14px;fill:#334155}.tick{font-size:12px;fill:#64748b}.legend{font-size:14px;fill:#334155}.table{font-size:13px;fill:#334155}.tablehead{font-size:13px;font-weight:700;fill:#0f172a}.note{font-size:14px;fill:#475569}</style>',
-        '<text x="70" y="55" class="title">Transformer Loss 实验对比与参数汇总（testA–testE）</text>',
-        '<text x="70" y="84" class="subtitle">横轴：累计训练时间（分钟）　·　分段等高纵轴：1–2、2–11　·　仅显示 valid loss　·　F 尚未开始</text>',
+        '<text x="70" y="55" class="title">Transformer Loss 实验对比与参数汇总（testA–testF）</text>',
+        '<text x="70" y="84" class="subtitle">横轴：累计训练时间（分钟）　·　分段等高纵轴：1–2、2–11　·　仅显示 valid loss</text>',
     ]
     px, py, pw, ph = left + 78, top + 78, panel_w - 115, panel_h - 150
     parts.extend([f'<rect x="{left}" y="{top}" width="{panel_w}" height="{panel_h}" rx="12" fill="#fff" stroke="#dbe3ee"/>',
@@ -168,7 +170,7 @@ def chart():
         parts.append(f'<text x="{lx + 38}" y="{legend_y + 5}" class="legend">{name}</text>')
     parts += [#f'<line x1="{left + 720}" y1="{legend_y}" x2="{left + 750}" y2="{legend_y}" stroke="#475569" stroke-width="3"/>',
               #f'<text x="{left + 758}" y="{legend_y + 5}" class="legend">valid loss</text>',
-              '<text x="70" y="875" class="note">testC：512×6、3e-4 的 valid loss 明显失稳；testD：降低 lr 后恢复到约 1.5。</text>',
+              '<text x="70" y="875" class="note">testC：512×6、3e-4 的 valid loss 明显失稳；testD：降低 lr 后恢复到约 1.5；testF：加入 lr warmup 后稳定降至约 1.39。</text>',
               '</svg>']
     (ROOT / "training_loss_comparison.svg").write_text("\n".join(parts), encoding="utf-8")
 

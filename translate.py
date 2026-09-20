@@ -291,12 +291,12 @@ def main():
         warmup_steps = max(1, round(total_steps * args.warmup_ratio))
 
         def lr_scale(step):
-            # 先线性升到 --lr，再用 cosine 平滑降到 0。
+            # 先线性升到 --lr，再用 cosine 平滑降到 0 // 余弦效果不好，先注释掉余弦
             if step < warmup_steps:
                 return (step + 1) / warmup_steps
-            decay_steps = max(1, total_steps - warmup_steps)
-            progress = min(1.0, (step - warmup_steps) / decay_steps)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+#            decay_steps = max(1, total_steps - warmup_steps)
+#            progress = min(1.0, (step - warmup_steps) / decay_steps)
+            return 1.0
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
         print(f"学习率：warmup {warmup_steps}/{total_steps} steps "
