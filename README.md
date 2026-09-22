@@ -49,13 +49,54 @@ or python translate.py --data parallel.tsv --limit 200000 --out runs/zh_en_200k
 python translate.py --data parallel.tsv --limit 0 --epochs 10 --out runs/full
 ```
 
-`--limit 0` 表示用全部数据。默认只处理较短句子，超过 96 个 token（含起止符）的句对会丢弃，实际数量会打印；需要长句时增大 `--max-len`，注意注意力计算和显存开销随长度增加很快。每次新训练请指定新的 `--out`，防止覆盖旧实验。
+`--limit 0` 表示用全部数据。默认只处理较短句子，超过 96 个 token（含起止符）的句对会丢弃，实际数量会打印；需要长句时增大 `--max-len`，注意注意力计算和显存开销随长度增加很快。每次新训练请指定新的 `--out`，防止覆盖旧实验。训练被中断时不要换目录，使用下一节的 `--resume` 从最近完成的一轮继续。
 
-## 4. 看结果、单独翻译
+## 4. 断点续训
 
-训练每 100 个 batch 打印一次 loss；每轮打印训练 loss、验证 loss、耗时，以及固定 3 条验证句子的「原文 / 参考译文 / 当前模型预测」。loss 是平均每个非 PAD token 的交叉熵，越低越好，但不是翻译准确率。训练 loss 下降而验证 loss 上升通常说明过拟合。
+每轮训练完成后，程序会把最近的完整训练状态保存到输出目录中的 `last.pt`。它包含模型、AdamW 优化器、混合精度缩放器、学习率调度器、最佳验证 loss 和已完成的 epoch。保存时先写临时文件再原子替换，降低保存过程中进程被 kill 导致断点损坏的风险。
 
-输出目录包含 `tokenizer.model`、`tokenizer.vocab`、`best.pt` 和 `loss.csv`。`best.pt` 保存验证 loss 最低的一轮；每轮显示的例句来自当轮模型，最终单独翻译则使用保存的最佳模型。`loss.csv` 可以用 Excel 打开画训练曲线。
+例如计划总共训练 30 轮：
+
+```bash
+python translate.py \
+  --data parallel_wmt_600k_clean.tsv \
+  --limit 600000 \
+  --epochs 30 \
+  --batch-size 64 \
+  --d-model 512 \
+  --layers 6 \
+  --lr 3e-4 \
+  --lr-warmup \
+  --warmup-ratio 0.1 \
+  --out runs/clean_data
+```
+
+如果训练被 kill，使用相同参数并增加 `--resume`：
+
+```bash
+python translate.py \
+  --data parallel_wmt_600k_clean.tsv \
+  --limit 600000 \
+  --epochs 30 \
+  --batch-size 64 \
+  --d-model 512 \
+  --layers 6 \
+  --lr 3e-4 \
+  --lr-warmup \
+  --warmup-ratio 0.1 \
+  --out runs/clean_data \
+  --resume
+```
+
+`--epochs` 表示目标总轮数，不是续训时额外增加的轮数。例如断点已经完成第 12 轮，仍指定 `--epochs 30`，程序会从第 13 轮训练到第 30 轮。断点按 epoch 保存，因此如果在某轮中途被 kill，该轮会从头重跑。
+
+续训时必须保持 `--data`、`--limit`、`--batch-size`、`--epochs`、`--lr`、warmup 设置、翻译方向和模型结构参数不变；程序会检查这些配置。数据文件内容也不应改变。`loss.csv` 会继续追加，不会覆盖已有记录。
+
+## 5. 看结果、单独翻译
+
+训练每 100 个 batch 打印一次 loss；每轮打印训练 loss、验证 loss 和耗时；每五轮还会用测试文件中的句子做一次 CPU 推理。loss 是平均每个非 PAD token 的交叉熵，越低越好，但不是翻译准确率。训练 loss 下降而验证 loss 上升通常说明过拟合。
+
+输出目录包含 `tokenizer.model`、`tokenizer.vocab`、`best.pt`、`last.pt` 和 `loss.csv`。`best.pt` 保存验证 loss 最低的一轮，用于单独翻译；`last.pt` 保存最近完成的一轮及完整训练状态，用于断点续训。`loss.csv` 可以用 Excel 打开画训练曲线。
 
 ```bash
 python translate.py --out runs/zh_en --text "我喜欢学习。"
@@ -69,9 +110,9 @@ python translate.py --data parallel.tsv --reverse --out runs/en_zh
 python translate.py --out runs/en_zh --text "I like learning."
 ```
 
-复制模型到另一台电脑时，保留同目录的 `best.pt` 和 `tokenizer.model`。超长输入会明确报错；生成达到长度上限时会停止，所以可能出现未完成的句子。
+复制模型到另一台电脑推理时，保留同目录的 `best.pt` 和 `tokenizer.model`；如果还要继续训练，还需保留 `last.pt`，并使用相同的数据和训练参数。超长输入会明确报错；生成达到长度上限时会停止，所以可能出现未完成的句子。
 
-## 5. 如何读代码
+## 6. 如何读代码
 
 按文件中的 1～4 节顺序读，再看 `main()` 如何把它们连起来：
 
@@ -88,16 +129,4 @@ python translate.py --out runs/en_zh --text "I like learning."
 
 3 万条、5 轮主要用来理解流程和观察学习；20 万条干净、领域一致的数据有机会学会常见短句，但泛化质量受数据影响很大，从零小模型不能期待通用翻译产品的效果。前几轮出现重复词、空译文、漏译并不罕见。请同时查看未见过的句子，别只凭训练句判断效果。
 
-为便于阅读，这里采用固定学习率 AdamW 和贪心解码，没有实现原论文的学习率日程、beam search、BLEU 或断点续训。架构是标准 Encoder–Decoder Transformer，训练配方是简化学习版。保存的是推理权重，重新运行训练会从头开始。
-
-python translate.py \
---data parallel_wmt_600k_clean \
---limit 600000 \
---epochs 30 \
---batch-size 64 \
---d-model 512 \
---layers 6 \
---lr 3e-4 \
---lr-warmup \
---warmup-ratio 0.1 \
---out runs/clean_data
+为便于阅读，这里采用 AdamW、可选的线性 warmup + cosine decay 和贪心解码，没有实现 beam search 或 BLEU。架构是标准 Encoder–Decoder Transformer，训练配方是简化学习版。程序同时保存最佳推理权重和最近一轮的完整训练断点。

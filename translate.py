@@ -208,6 +208,7 @@ def main():
     p.add_argument("--data", default="parallel.tsv", help="无表头的中文 TAB 英文文件")
     p.add_argument("--out", default="runs/zh_en", help="模型和词表的保存目录")
     p.add_argument("--text", help="提供句子时加载模型进行翻译，不训练")
+    p.add_argument("--resume", action="store_true", help="从 --out/last.pt 继续训练")
     p.add_argument("--reverse", action="store_true", help="训练英译中（默认中译英）")
     p.add_argument("--limit", type=int, default=30000, help="随机抽样条数；0 为全量")
     p.add_argument("--epochs", type=int, default=5)
@@ -248,8 +249,13 @@ def main():
     # 每次实验单独保存，避免新词表覆盖旧模型所依赖的词表。
     # Transformer 的参数和 tokenizer 必须配套，否则同一个 id 可能代表不同子词。
     out.mkdir(parents=True, exist_ok=True)
-    if any(out.iterdir()):
-        p.error("输出目录非空，请用 --out 指定一个新目录")
+    if args.resume:
+        if not (out / "last.pt").is_file():
+            p.error(f"找不到断点文件：{out / 'last.pt'}")
+        if not (out / "tokenizer.model").is_file():
+            p.error(f"找不到断点配套词表：{out / 'tokenizer.model'}")
+    elif any(out.iterdir()):
+        p.error("输出目录非空，请用 --out 指定一个新目录，或用 --resume 继续训练")
     pairs = read_pairs(args.data, args.limit, args.reverse)
     if len(pairs) < 20:
         p.error("至少需要 20 条去重后的句对；学习训练建议数万条")
@@ -257,13 +263,14 @@ def main():
     # 验证集只用来检查泛化效果，不参与参数更新。
     valid_pairs, train_pairs = pairs[:n_valid], pairs[n_valid:]
     # 先划分验证集，再仅用训练文本学习 BPE，避免验证文本参与词表训练。
-    spm.SentencePieceTrainer.train(
-        sentence_iterator=(s for pair in train_pairs for s in pair),
-        model_prefix=str(out / "tokenizer"), model_type="bpe",
-        vocab_size=args.vocab_size, character_coverage=0.9995,
-        pad_id=PAD, unk_id=UNK, bos_id=BOS, eos_id=EOS,
-        hard_vocab_limit=False, minloglevel=2,
-    )
+    if not args.resume:
+        spm.SentencePieceTrainer.train(
+            sentence_iterator=(s for pair in train_pairs for s in pair),
+            model_prefix=str(out / "tokenizer"), model_type="bpe",
+            vocab_size=args.vocab_size, character_coverage=0.9995,
+            pad_id=PAD, unk_id=UNK, bos_id=BOS, eos_id=EOS,
+            hard_vocab_limit=False, minloglevel=2,
+        )
     sp = spm.SentencePieceProcessor(model_file=str(out / "tokenizer.model"))
     cpu_test_sentences = [line.strip() for line in Path(
         "./transformer_test/test_data/test_data/test.md"
@@ -308,14 +315,48 @@ def main():
               f"({args.warmup_ratio:.0%}) → 峰值 {args.lr:g} → cosine decay", flush=True)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     direction = "英 → 中" if args.reverse else "中 → 英"
+    training_config = {
+        "data": str(Path(args.data).resolve()),
+        "limit": args.limit,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "lr_warmup": args.lr_warmup,
+        "warmup_ratio": args.warmup_ratio,
+    }
+    start_epoch = 1
+    best = float("inf")
+    if args.resume:
+        ckpt = torch.load(out / "last.pt", map_location=device, weights_only=True)
+        if ckpt["config"] != config:
+            p.error(f"断点模型配置 {ckpt['config']} 与当前参数 {config} 不一致")
+        if ckpt["direction"] != direction:
+            p.error(f"断点方向为 {ckpt['direction']}，与当前方向 {direction} 不一致")
+        if ckpt.get("training_config") != training_config:
+            p.error("断点与当前 data/limit/batch-size/epochs/lr/warmup 参数不一致")
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scaler.load_state_dict(ckpt["scaler"])
+        saved_scheduler = ckpt.get("scheduler")
+        if (scheduler is None) != (saved_scheduler is None):
+            p.error("断点与当前 --lr-warmup 设置不一致")
+        if scheduler is not None:
+            scheduler.load_state_dict(saved_scheduler)
+        best = ckpt["best"]
+        start_epoch = ckpt["epoch"] + 1
+        if start_epoch > args.epochs:
+            p.error(f"断点已完成 {ckpt['epoch']} 轮，--epochs 必须更大")
+        print(f"已恢复断点：完成 {ckpt['epoch']} 轮，将从第 {start_epoch} 轮继续", flush=True)
     print(f"{direction} | 训练 {len(train_data)} / 验证 {len(valid_data)} 句对 | "
           f"过滤 {len(pairs) - len(train_data) - len(valid_data)} 条超长句对 | "
           f"参数 {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M", flush=True)
-    best = float("inf")
-    with open(out / "loss.csv", "w", newline="", encoding="utf-8") as f:
+    loss_path = out / "loss.csv"
+    write_header = not args.resume or not loss_path.exists() or loss_path.stat().st_size == 0
+    with open(loss_path, "a" if args.resume else "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "valid_loss", "seconds"])
-        for epoch in range(1, args.epochs + 1):
+        if write_header:
+            writer.writerow(["epoch", "train_loss", "valid_loss", "seconds"])
+        for epoch in range(start_epoch, args.epochs + 1):
             start = time.perf_counter()
             # 一轮（epoch）就是把整个训练集完整看一遍。
             train_loss = run_epoch(model, train_loader, optimizer, scaler, device, scheduler)
@@ -332,6 +373,22 @@ def main():
                 best = valid_loss
                 torch.save({"model": model.state_dict(), "config": config,
                             "direction": direction}, out / "best.pt")
+            # last.pt 用于续训，保存最近完整 epoch 的全部训练状态。
+            # 先写临时文件再原子替换，避免保存途中被 kill 损坏已有断点。
+            last_state = {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "best": best,
+                "config": config,
+                "direction": direction,
+                "training_config": training_config,
+            }
+            last_tmp = out / "last.pt.tmp"
+            torch.save(last_state, last_tmp)
+            last_tmp.replace(out / "last.pt")
             # 每五轮读取 test.md 中的全部句子，并明确在 CPU 上推理。
             if epoch % 5 == 0:
                 cpu = torch.device("cpu")
