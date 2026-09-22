@@ -266,7 +266,7 @@ def main():
     )
     sp = spm.SentencePieceProcessor(model_file=str(out / "tokenizer.model"))
     cpu_test_sentences = [line.strip() for line in Path(
-        "/home/evrenchen/daily_work/transformer_test/test_data/test_data/test.md"
+        "./transformer_test/test_data/test_data/test.md"
     ).read_text(encoding="utf-8").splitlines() if line.strip()]
     if not cpu_test_sentences:
         p.error("CPU 测试文本为空")

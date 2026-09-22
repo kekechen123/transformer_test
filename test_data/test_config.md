@@ -22,4 +22,7 @@ testF : --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1 //vali
 
 testG : --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1  //valid loss 下降明显比F慢，1.5卡死。 
 
-## 惊人发现：新增的400k数据集中存在大量垃圾乱码！被坑了！！！重搞数据！！！
+## 惊人发现：新增的400k数据集中存在大量垃圾乱码！被坑了！！！重搞数据！！！用干净的数据复刻F测试，还是选择30个epoch。
+
+testF+ : --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1 //效果十分显著，收敛速度变快且在15个epoch达到了1.34这个最好成绩，但下降也变得开始缓慢，我给终止了。
+

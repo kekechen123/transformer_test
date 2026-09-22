@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1700" height="930" viewBox="0 0 1700 930">
 <rect width="100%" height="100%" fill="#f8fafc"/>
 <style>text{font-family:Arial,"Noto Sans SC",sans-serif;fill:#0f172a}.title{font-size:30px;font-weight:700}.subtitle{font-size:15px;fill:#64748b}.panel{font-size:20px;font-weight:700}.axis{font-size:14px;fill:#334155}.tick{font-size:12px;fill:#64748b}.legend{font-size:14px;fill:#334155}.table{font-size:13px;fill:#334155}.tablehead{font-size:13px;font-weight:700;fill:#0f172a}.note{font-size:14px;fill:#475569}</style>
-<text x="70" y="55" class="title">Transformer Loss 实验对比与参数汇总（testA–testF）</text>
+<text x="70" y="55" class="title">Transformer Loss 实验对比与参数汇总（testA–testG、testF+）</text>
 <text x="70" y="84" class="subtitle">横轴：累计训练时间（分钟）　·　分段等高纵轴：1–2、2–11　·　仅显示 valid loss</text>
 <rect x="70" y="125" width="1050" height="690" rx="12" fill="#fff" stroke="#dbe3ee"/>
 <text x="95" y="163" class="panel">Loss 曲线（分段等高纵轴）</text>
@@ -63,6 +63,8 @@
 <polyline points="159.6,412.6 171.4,428.3 183.1,446.8 194.8,459.7 206.6,467.1 218.3,471.9 230.1,494.6 241.8,514.8 253.6,533.5 265.3,547.6 277.0,557.9 288.8,564.5 300.5,576.2 312.2,580.6 324.0,585.2 335.7,590.0 347.4,595.0 359.1,599.2 370.8,600.8 382.5,603.8 394.3,605.3 406.0,602.8 417.7,606.2 429.5,609.2 441.2,607.5 452.9,609.8 464.7,610.7 476.4,608.7 488.1,609.4" fill="none" stroke="#059669" stroke-width="3"/>
 <polyline points="183.6,433.0 219.3,459.6 254.9,469.9 290.6,488.2 326.2,517.6" fill="none" stroke="#ea580c" stroke-width="3"/>
 <polyline points="184.0,422.6 219.7,459.7 255.8,469.9 291.9,500.0 328.0,526.2 364.0,544.6 400.0,559.5 436.0,568.7 472.0,577.1 507.7,587.4 543.8,594.1 579.7,599.3 615.7,606.9 651.7,611.1 687.7,613.3 723.8,618.7 759.8,620.9 795.7,627.1 831.6,629.1 867.5,629.4 903.5,633.2 939.4,632.9 975.3,635.3 1011.3,635.5 1047.1,635.5 1083.0,636.7" fill="none" stroke="#0891b2" stroke-width="3"/>
+<polyline points="186.8,422.6 226.2,459.8 264.5,469.9 303.4,496.8 342.8,525.8 381.2,543.6 419.4,557.2 458.3,564.3 495.5,573.1 532.9,578.9 571.4,584.8 610.7,589.2 649.6,591.2 685.6,596.5 724.2,597.8 761.2,600.9 798.9,603.5" fill="none" stroke="#7c3aed" stroke-width="3"/>
+<polyline points="184.1,430.3 220.3,465.5 256.2,496.9 292.2,543.5 328.2,569.5 364.3,587.2 400.2,598.5 436.1,607.5 472.0,619.3 508.0,624.3 544.1,634.0 580.0,636.4 615.9,643.6 651.8,646.6 687.7,650.0 723.7,653.9" fill="none" stroke="#16a34a" stroke-width="3"/>
 <rect x="1160" y="125" width="485" height="690" rx="12" fill="#fff" stroke="#dbe3ee"/>
 <text x="1185" y="163" class="panel">实验参数与结果</text>
 <line x1="1178" y1="210" x2="1627" y2="210" stroke="#cbd5e1"/>
@@ -128,6 +130,24 @@
 <text x="1460" y="488" class="table">64</text>
 <text x="1515" y="488" class="table">26</text>
 <text x="1570" y="488" class="table">1.394</text>
+<line x1="1178" y1="553" x2="1627" y2="553" stroke="#eef2f7"/>
+<text x="1182" y="536" class="table">testG</text>
+<text x="1236" y="536" class="table">600k</text>
+<text x="1292" y="536" class="table">512</text>
+<text x="1362" y="536" class="table">6</text>
+<text x="1405" y="536" class="table">3e-4</text>
+<text x="1460" y="536" class="table">64</text>
+<text x="1515" y="536" class="table">17</text>
+<text x="1570" y="536" class="table">1.517</text>
+<line x1="1178" y1="601" x2="1627" y2="601" stroke="#eef2f7"/>
+<text x="1182" y="584" class="table">testF+</text>
+<text x="1236" y="584" class="table">600k干净</text>
+<text x="1292" y="584" class="table">512</text>
+<text x="1362" y="584" class="table">6</text>
+<text x="1405" y="584" class="table">3e-4</text>
+<text x="1460" y="584" class="table">64</text>
+<text x="1515" y="584" class="table">16</text>
+<text x="1570" y="584" class="table">1.330</text>
 <line x1="70" y1="853" x2="100" y2="853" stroke="#2563eb" stroke-width="3"/>
 <text x="108" y="858" class="legend">testA</text>
 <line x1="205" y1="853" x2="235" y2="853" stroke="#dc2626" stroke-width="3"/>
@@ -140,5 +160,9 @@
 <text x="648" y="858" class="legend">testE</text>
 <line x1="745" y1="853" x2="775" y2="853" stroke="#0891b2" stroke-width="3"/>
 <text x="783" y="858" class="legend">testF</text>
-<text x="70" y="875" class="note">testC：512×6、3e-4 的 valid loss 明显失稳；testD：降低 lr 后恢复到约 1.5；testF：加入 lr warmup 后稳定降至约 1.39。</text>
+<line x1="880" y1="853" x2="910" y2="853" stroke="#7c3aed" stroke-width="3"/>
+<text x="918" y="858" class="legend">testG</text>
+<line x1="1015" y1="853" x2="1045" y2="853" stroke="#16a34a" stroke-width="3"/>
+<text x="1053" y="858" class="legend">testF+</text>
+<text x="70" y="875" class="note">testC：512×6、3e-4 的 valid loss 明显失稳；testF vs testG：cosine 衰减有效；testF+：清洗垃圾数据后 valid loss 降至约 1.33。</text>
 </svg>
