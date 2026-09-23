@@ -158,6 +158,12 @@ def translate(model, sp, sentence, device, decode="greedy", beam_size=2):
         raise ValueError("beam_size 必须大于等于 1")
 
     # 每个候选保存：(token 序列, 累计对数概率, 是否已生成 EOS)。
+    # 长度归一化避免累计 log probability 天然偏爱过早输出 EOS 的短译文。
+    def beam_score(item):
+        token_ids, score, _ = item
+        length_penalty = ((5 + max(1, len(token_ids) - 1)) / 6) ** 0.6
+        return score / length_penalty
+
     beams = [([BOS], 0.0, False)]
     for _ in range(max_len - 1):
         candidates = []
@@ -178,12 +184,12 @@ def translate(model, sp, sentence, device, decode="greedy", beam_size=2):
                     token_id == EOS,
                 ))
 
-        candidates.sort(key=lambda item: item[1], reverse=True)
+        candidates.sort(key=beam_score, reverse=True)
         beams = candidates[:beam_size]
         if all(finished for _, _, finished in beams):
             break
 
-    token_ids, _, _ = max(beams, key=lambda item: item[1])
+    token_ids, _, _ = max(beams, key=beam_score)
     if EOS in token_ids:
         token_ids = token_ids[1:token_ids.index(EOS)]
     else:

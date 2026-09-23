@@ -26,3 +26,4 @@ testG : --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1  //val
 
 testF+ : --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1 //效果十分显著，收敛速度变快且在15个epoch达到了1.34这个最好成绩，但下降也变得开始缓慢，我给终止了。
 
+test_f+_clean： --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1 // 重复上个实验跑到了28epoch，停止在了1.26，感觉长句还不是很理想。
