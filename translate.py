@@ -125,7 +125,7 @@ class Translator(nn.Module):
 
 # 3. 推理：从 BOS 开始，每次预测下一个词，遇到 EOS 停止。
 @torch.no_grad()
-def translate(model, sp, sentence, device):
+def translate(model, sp, sentence, device, decode="greedy", beam_size=2):
     model.eval()  # 关闭 dropout；no_grad 则关闭梯度记录，两者用途不同。
     # 推理阶段只需要前向计算，不需要反向传播和更新参数，因此不保存梯度。
     ids = encode(sp, sentence)
@@ -136,20 +136,59 @@ def translate(model, sp, sentence, device):
     src = torch.tensor([ids], device=device)
     src_pad = src.eq(PAD)
     memory = model.transformer.encoder(model.embed(src), src_key_padding_mask=src_pad)
-    # 目标句目前只有 BOS，后面每轮把模型新预测出的 token 接到末尾。
-    tgt = torch.tensor([[BOS]], device=device)
+    if decode == "greedy":
+        # 目标句目前只有 BOS，后面每轮把模型新预测出的 token 接到末尾。
+        tgt = torch.tensor([[BOS]], device=device)
+        for _ in range(max_len - 1):
+            # 只取最后一个位置的预测，因为前面位置已经生成过了。
+            logits = model.decode(tgt, memory, src_pad)[:, -1, :]
+            # 生成过程中不希望再次生成 PAD 或 BOS，所以把它们的分数设为负无穷。
+            logits[:, [PAD, BOS]] = -float("inf")
+            next_id = logits.argmax(dim=-1, keepdim=True)  # 贪心解码，便于理解。
+            if next_id.item() == EOS:
+                break
+            # 沿句子长度这一维拼接新 token；下一轮会把更长的 tgt 再交给解码器。
+            tgt = torch.cat([tgt, next_id], dim=1)
+        # 去掉开头的 BOS，再把 token id 还原为可读字符串。
+        return sp.decode(tgt[0, 1:].tolist())
+
+    if decode != "beam":
+        raise ValueError(f"不支持的解码方式：{decode}")
+    if beam_size < 1:
+        raise ValueError("beam_size 必须大于等于 1")
+
+    # 每个候选保存：(token 序列, 累计对数概率, 是否已生成 EOS)。
+    beams = [([BOS], 0.0, False)]
     for _ in range(max_len - 1):
-        # 只取最后一个位置的预测，因为前面位置已经生成过了。
-        logits = model.decode(tgt, memory, src_pad)[:, -1, :]
-        # 生成过程中不希望再次生成 PAD 或 BOS，所以把它们的分数设为负无穷。
-        logits[:, [PAD, BOS]] = -float("inf")
-        next_id = logits.argmax(dim=-1, keepdim=True)  # 贪心解码，便于理解。
-        if next_id.item() == EOS:
+        candidates = []
+        for token_ids, score, finished in beams:
+            if finished:
+                candidates.append((token_ids, score, True))
+                continue
+
+            tgt = torch.tensor([token_ids], device=device)
+            logits = model.decode(tgt, memory, src_pad)[:, -1, :]
+            logits[:, [PAD, BOS]] = -float("inf")
+            log_probs = torch.log_softmax(logits, dim=-1)[0]
+            top_scores, top_ids = torch.topk(log_probs, beam_size)
+            for token_score, token_id in zip(top_scores.tolist(), top_ids.tolist()):
+                candidates.append((
+                    token_ids + [token_id],
+                    score + token_score,
+                    token_id == EOS,
+                ))
+
+        candidates.sort(key=lambda item: item[1], reverse=True)
+        beams = candidates[:beam_size]
+        if all(finished for _, _, finished in beams):
             break
-        # 沿句子长度这一维拼接新 token；下一轮会把更长的 tgt 再交给解码器。
-        tgt = torch.cat([tgt, next_id], dim=1)
-    # 去掉开头的 BOS，再把 token id 还原为可读字符串。
-    return sp.decode(tgt[0, 1:].tolist())
+
+    token_ids, _, _ = max(beams, key=lambda item: item[1])
+    if EOS in token_ids:
+        token_ids = token_ids[1:token_ids.index(EOS)]
+    else:
+        token_ids = token_ids[1:]
+    return sp.decode(token_ids)
 
 
 # 4. 一轮训练/验证：Teacher Forcing，用真实前缀预测下一个真实词。
@@ -208,6 +247,10 @@ def main():
     p.add_argument("--data", default="parallel.tsv", help="无表头的中文 TAB 英文文件")
     p.add_argument("--out", default="runs/zh_en", help="模型和词表的保存目录")
     p.add_argument("--text", help="提供句子时加载模型进行翻译，不训练")
+    p.add_argument("--decode", choices=("greedy", "beam"), default="greedy",
+                   help="推理解码方式（默认 greedy）")
+    p.add_argument("--beam-size", type=int, default=2,
+                   help="beam search 保留的候选数量（默认 2）")
     p.add_argument("--resume", action="store_true", help="从 --out/last.pt 继续训练")
     p.add_argument("--reverse", action="store_true", help="训练英译中（默认中译英）")
     p.add_argument("--limit", type=int, default=30000, help="随机抽样条数；0 为全量")
@@ -238,7 +281,9 @@ def main():
         model = Translator(**ckpt["config"]).to(device)
         model.load_state_dict(ckpt["model"])
         print(f"方向：{ckpt['direction']}")
-        print(translate(model, sp, args.text, device))
+        if args.beam_size < 1:
+            p.error("--beam-size 必须大于等于 1")
+        print(translate(model, sp, args.text, device, args.decode, args.beam_size))
         return
 
     if (args.d_model < 4 or args.d_model % 4 or args.layers < 1 or args.max_len < 4
@@ -273,7 +318,7 @@ def main():
         )
     sp = spm.SentencePieceProcessor(model_file=str(out / "tokenizer.model"))
     cpu_test_sentences = [line.strip() for line in Path(
-        "./transformer_test/test_data/test_data/test.md"
+        "./test_data/test_data/test.md"
     ).read_text(encoding="utf-8").splitlines() if line.strip()]
     if not cpu_test_sentences:
         p.error("CPU 测试文本为空")
