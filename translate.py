@@ -136,6 +136,20 @@ def translate(model, sp, sentence, device, decode="greedy", beam_size=2):
     src = torch.tensor([ids], device=device)
     src_pad = src.eq(PAD)
     memory = model.transformer.encoder(model.embed(src), src_key_padding_mask=src_pad)
+
+    def block_repeated_ngram(logits, token_ids, n=3):
+        # 禁止生成已经出现过的 n-gram，避免句号或短语循环到长度上限。
+        if len(token_ids) < n - 1:
+            return
+        prefix = token_ids[-(n - 1):]
+        blocked = {
+            token_ids[i + n - 1]
+            for i in range(len(token_ids) - n + 1)
+            if token_ids[i:i + n - 1] == prefix
+        }
+        if blocked:
+            logits[..., list(blocked)] = -float("inf")
+
     if decode == "greedy":
         # 目标句目前只有 BOS，后面每轮把模型新预测出的 token 接到末尾。
         tgt = torch.tensor([[BOS]], device=device)
@@ -144,6 +158,7 @@ def translate(model, sp, sentence, device, decode="greedy", beam_size=2):
             logits = model.decode(tgt, memory, src_pad)[:, -1, :]
             # 生成过程中不希望再次生成 PAD 或 BOS，所以把它们的分数设为负无穷。
             logits[:, [PAD, BOS]] = -float("inf")
+            block_repeated_ngram(logits, tgt[0].tolist())
             next_id = logits.argmax(dim=-1, keepdim=True)  # 贪心解码，便于理解。
             if next_id.item() == EOS:
                 break
@@ -175,6 +190,7 @@ def translate(model, sp, sentence, device, decode="greedy", beam_size=2):
             tgt = torch.tensor([token_ids], device=device)
             logits = model.decode(tgt, memory, src_pad)[:, -1, :]
             logits[:, [PAD, BOS]] = -float("inf")
+            block_repeated_ngram(logits, token_ids)
             log_probs = torch.log_softmax(logits, dim=-1)[0]
             top_scores, top_ids = torch.topk(log_probs, beam_size)
             for token_score, token_id in zip(top_scores.tolist(), top_ids.tolist()):
