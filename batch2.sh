@@ -9,7 +9,18 @@ BEAM_SIZE=4
     printf '测试集：`%s`\n\n' "$TEST_FILE"
     printf '推理设备：CPU\n\n'
     printf '解码方式：Beam search（beam size = %d）\n\n' "$BEAM_SIZE"
+    printf '| 序号 | 原文 | Beam 翻译 |\n'
+    printf '|---:|---|---|\n'
 } > "$OUTPUT_FILE"
+
+escape_md_cell() {
+    local text="$1"
+    text=${text//\\/\\\\}
+    text=${text//|/\\|}
+    text=${text//$'\r'/}
+    text=${text//$'\n'/<br>}
+    printf '%s' "$text"
+}
 
 sentence_no=0
 
@@ -19,20 +30,20 @@ while IFS= read -r sentence || [[ -n "$sentence" ]]; do
 
     sentence_no=$((sentence_no + 1))
 
-    {
-        printf '## 第 %d 句\n\n' "$sentence_no"
-        printf '**原文：** %s\n\n' "$sentence"
-        printf '### Beam size = %d\n\n' "$BEAM_SIZE"
-
+    translation=$(
         CUDA_VISIBLE_DEVICES="" python3 translate.py \
             --out "$MODEL_OUT" \
             --text "$sentence" \
             --decode beam \
             --beam-size "$BEAM_SIZE" \
         | tail -n 1
+    )
 
-        printf '\n\n%s\n\n' '---'
-    } >> "$OUTPUT_FILE"
+    printf '| %d | %s | %s |\n' \
+        "$sentence_no" \
+        "$(escape_md_cell "$sentence")" \
+        "$(escape_md_cell "$translation")" \
+        >> "$OUTPUT_FILE"
 done < "$TEST_FILE"
 
 printf '测试完成，结果已保存到：%s\n' "$OUTPUT_FILE"
