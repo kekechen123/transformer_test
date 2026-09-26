@@ -1,4 +1,9 @@
-"""Generate ordered experiment summary and loss comparison SVG for test_data."""
+"""Generate a complete experiment summary and loss comparison SVG.
+
+The experiment list mirrors test_config.md.  The script intentionally keeps the
+metadata here explicit so that the chart remains reproducible even when the
+training CSVs only contain loss values.
+"""
 import csv
 import html
 from pathlib import Path
@@ -7,27 +12,32 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 EXPERIMENTS = [
     ("testA", "test_a_loss.csv", "200k", "3e-4", 64, 256, 3,
-     "train / valid loss 在 1.5 附近震荡"),
+     "train / valid loss 在 1.5 附近震荡", "固定 lr", "原始数据"),
     ("testB", "test_b_loss.csv", "200k", "3e-4", 64, 384, 4,
-     "train 继续下降，valid loss 在 1.4–1.5 附近震荡"),
+     "train 继续下降，valid loss 在 1.4–1.5 附近震荡", "固定 lr", "原始数据"),
     ("testC", "test_c_loss.csv", "200k", "3e-4", 64, 512, 6,
-     "valid loss 飙升到 10，训练不稳定"),
+     "valid loss 飙升到 10，训练不稳定", "固定 lr", "原始数据"),
     ("testD", "test_d_loss.csv", "200k", "1e-4", 64, 512, 6,
-     "train 降至约 1.1，valid loss 在 1.5 附近震荡，泛化性缺失"),
+     "train 降至约 1.1，valid loss 在 1.5 附近震荡，疑似泛化性缺失", "固定 lr", "原始数据"),
     ("testE", "test_e_loss.csv", "600k", "1e-4", 64, 512, 6,
-     "loss 到 2 左右后下降变慢，可能需要更长训练或调整学习率"),
+     "loss 到 2 左右后下降变慢，怀疑学习率不够", "固定 lr", "含垃圾数据"),
     ("testF", "test_f_loss.csv", "600k", "3e-4", 64, 512, 6,
-     "加入 lr warmup（warmup ratio 0.1）后 valid loss 稳定下降到约 1.39"),
+     "warmup 后 valid loss 稳定下降到约 1.39，随后震荡", "warmup 0.1 + cosine", "含垃圾数据"),
     ("testG", "test_G_loss.csv", "600k", "3e-4", 64, 512, 6,
-     "加入 lr warmup 但取消 cosine 衰减，valid loss 在约 1.52 附近变慢"),
+     "取消 cosine 衰减后 valid loss 下降较慢，在约 1.52 卡住", "warmup 0.1，无 cosine", "含垃圾数据"),
     ("testF+", "test_f+_loss.csv", "600k干净", "3e-4", 64, 512, 6,
-     "清洗垃圾数据后复刻 F，valid loss 在第 16 轮达到约 1.33"),
+     "清洗垃圾数据后复刻 F，valid loss 在第 16 轮达到约 1.33；下降变慢后提前终止",
+     "warmup 0.1 + cosine", "干净数据"),
+    ("testF+ clean", "test_f+_clean_loss.csv", "600k干净", "3e-4", 64, 512, 6,
+     "重复 F+ 并训练到第 28 轮，valid loss 停在约 1.26，长句效果仍不理想",
+     "warmup 0.1 + cosine", "干净数据"),
 ]
 COLORS = {"testA": "#2563eb", "testB": "#dc2626", "testC": "#9333ea",
           "testD": "#059669", "testE": "#ea580c", "testF": "#0891b2",
-          "testG": "#7c3aed", "testF+": "#16a34a"}
+          "testG": "#7c3aed", "testF+": "#16a34a", "testF+ clean": "#65a30d"}
 
-
+# Add schedule/data annotations to the entries above that predate the extra
+# metadata fields.  This keeps the configuration table easy to edit.
 def load_data(filename):
     with (ROOT / filename).open(newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
@@ -39,7 +49,7 @@ def fmt(value):
 
 def summary():
     result = []
-    for name, filename, dataset, lr, batch, d_model, layers, note in EXPERIMENTS:
+    for name, filename, dataset, lr, batch, d_model, layers, note, schedule, data_status in EXPERIMENTS:
         rows = load_data(filename)
         train = [float(r["train_loss"]) for r in rows]
         valid = [float(r["valid_loss"]) for r in rows]
@@ -49,7 +59,7 @@ def summary():
             "train_first": train[0], "train_last": train[-1],
             "valid_best": min(valid), "valid_last": valid[-1],
             "seconds_avg": sum(float(r["seconds"]) for r in rows) / len(rows),
-            "note": note,
+            "note": note, "schedule": schedule, "data_status": data_status,
         })
     return result
 
@@ -58,15 +68,15 @@ def write_summary(rows):
     lines = [
         "# Transformer 实验结果汇总",
         "",
-        "纳入已有 CSV 结果的 testA–testG 和 testF+。",
+        "纳入 test_config.md 中全部 9 组实验：testA–testG、testF+、testF+ clean。",
         "",
-        "| 实验 | 数据量 | d-model | layers | lr | batch-size | epochs | train 首/末 | valid 最优 | valid 末轮 | 平均每 epoch(s) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| 实验 | 数据量 | d-model | layers | lr | batch-size | epochs | schedule | 数据状态 | train 首/末 | valid 最优 | valid 末轮 | 平均每 epoch(s) |",
+        "|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|",
     ]
     for r in rows:
         lines.append(
             f"| {r['name']} | {r['dataset']} | {r['d_model']} | {r['layers']} | "
-            f"{r['lr']} | {r['batch']} | {r['epochs']} | "
+            f"{r['lr']} | {r['batch']} | {r['epochs']} | {r['schedule']} | {r['data_status']} | "
             f"{fmt(r['train_first'])} / {fmt(r['train_last'])} | "
             f"{fmt(r['valid_best'])} | {fmt(r['valid_last'])} | {r['seconds_avg']:.1f} |"
         )
@@ -74,8 +84,8 @@ def write_summary(rows):
     for r in rows:
         lines.append(f"- **{r['name']}**：数据集规模 `{r['dataset']}`，`--d-model {r['d_model']}`，"
                      f"`--layers {r['layers']}`，`--lr {r['lr']}`，`--batch-size {r['batch']}`。"
-                     f" {r['note']}。")
-    lines += ["", "## 读图说明", "", "图中只绘制 valid loss，横轴为按每个 epoch 的 seconds 累加得到的训练时间（分钟），纵轴采用分段等高显示：`1–2`、`2–11` 两段各占一半。"]
+                     f"调度：{r['schedule']}；数据：{r['data_status']}。{r['note']}。")
+    lines += ["", "## 读图说明", "", "图中只绘制 valid loss；横轴为按每个 epoch 的 seconds 累加得到的训练时间（分钟），纵轴采用分段等高显示：`1–2`、`2–11` 两段各占一半。"]
     (ROOT / "experiment_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -155,9 +165,9 @@ def chart():
     table_x, table_y, table_w = right, top, width - right - 55
     parts.extend([f'<rect x="{table_x}" y="{table_y}" width="{table_w}" height="{panel_h}" rx="12" fill="#fff" stroke="#dbe3ee"/>',
                   f'<text x="{table_x + 25}" y="{table_y + 38}" class="panel">实验参数与结果</text>'])
-    cols = [(table_x + 22, "实验"), (table_x + 76, "数据"), (table_x + 132, "d-model"),
-            (table_x + 202, "层数"), (table_x + 245, "lr"), (table_x + 300, "batch"),
-            (table_x + 355, "epoch"), (table_x + 410, "valid 最优")]
+    cols = [(table_x + 22, "实验"), (table_x + 105, "数据"), (table_x + 175, "d-model"),
+            (table_x + 245, "层数"), (table_x + 285, "lr"), (table_x + 340, "epoch"),
+            (table_x + 395, "valid 最优")]
     header_y = table_y + 75
     parts.append(f'<line x1="{table_x + 18}" y1="{header_y + 10}" x2="{table_x + table_w - 18}" y2="{header_y + 10}" stroke="#cbd5e1"/>')
     for x, label in cols:
@@ -165,17 +175,18 @@ def chart():
     for i, row in enumerate(rows):
         y = header_y + 48 + i * 48
         parts.append(f'<line x1="{table_x + 18}" y1="{y + 17}" x2="{table_x + table_w - 18}" y2="{y + 17}" stroke="#eef2f7"/>')
-        values = [row["name"], row["dataset"], str(row["d_model"]), str(row["layers"]), row["lr"], str(row["batch"]), str(row["epochs"]), fmt(row["valid_best"])]
+        values = [row["name"], row["dataset"], str(row["d_model"]), str(row["layers"]), row["lr"], str(row["epochs"]), fmt(row["valid_best"])]
         for (x, _), value in zip(cols, values):
             parts.append(f'<text x="{x}" y="{y}" class="table">{html.escape(value)}</text>')
     legend_y = top + panel_h + 38
     for i, (name, _) in enumerate(datasets):
-        lx = left + i * 135
-        parts.append(f'<line x1="{lx}" y1="{legend_y}" x2="{lx + 30}" y2="{legend_y}" stroke="{COLORS[name]}" stroke-width="3"/>')
-        parts.append(f'<text x="{lx + 38}" y="{legend_y + 5}" class="legend">{name}</text>')
+        lx = left + (i % 5) * 205
+        ly = legend_y + (i // 5) * 24
+        parts.append(f'<line x1="{lx}" y1="{ly}" x2="{lx + 30}" y2="{ly}" stroke="{COLORS[name]}" stroke-width="3"/>')
+        parts.append(f'<text x="{lx + 38}" y="{ly + 5}" class="legend">{html.escape(name)}</text>')
     parts += [#f'<line x1="{left + 720}" y1="{legend_y}" x2="{left + 750}" y2="{legend_y}" stroke="#475569" stroke-width="3"/>',
               #f'<text x="{left + 758}" y="{legend_y + 5}" class="legend">valid loss</text>',
-              '<text x="70" y="875" class="note">testC：512×6、3e-4 的 valid loss 明显失稳；testF vs testG：cosine 衰减有效；testF+：清洗垃圾数据后 valid loss 降至约 1.33。</text>',
+              '<text x="70" y="875" class="note">testC：512×6、3e-4 明显失稳；testF vs testG：cosine 衰减带来更快下降；testF+ clean：干净数据训练至第 28 轮，valid loss 最低约 1.26。</text>',
               '</svg>']
     (ROOT / "training_loss_comparison.svg").write_text("\n".join(parts), encoding="utf-8")
 
