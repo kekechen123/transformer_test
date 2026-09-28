@@ -16,7 +16,7 @@ testE : --d-model 512 --layers 6 --lr 1e-4  // loss到2左右开始下降缓慢�
 
 ## 600k ，30epoch，学习率回复3e-4，但为了稳定加入lr_warmup，前10%增加，后续cos衰减到0 :
 
-testF : --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1 //valid loss 稳定下降到约 1.39开始震荡。个人判断：疑似衰减严重，导致无法训练？
+testF : --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1 //valid loss 稳定下降到约 1.39开始震荡。
 
 ## 600k ，30epoch，保持lr_warmup 不变，但cos衰减删除，峰值后保持lr 3e-4
 
@@ -27,3 +27,24 @@ testG : --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1  //val
 testF+ : --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1 //效果十分显著，收敛速度变快且在15个epoch达到了1.34这个最好成绩，但下降也变得开始缓慢，我给终止了。
 
 test_f+_clean： --d-model 512 --layers 6 --lr 3e-4 --lr-warmup --warmup-ratio 0.1 // 重复上个实验跑到了28epoch，停止在了1.26，感觉长句还不是很理想。
+
+f+clean_fin :上面参数不变，发现上面有脏数据导致不准确，清洗数据后重跑，但发现loss在1.30上下震荡。
+
+## 调查发现，基础翻译基本可用，部分单词在词表中是拆开的，且数据太少导致翻译错误，比如花生——flower，因为词表中是花和生，没有花生，且数据中花生也很少。所以更换更口语化的一版数据集，1m严格筛选到500k左右，并且扩大vocab到16000，考虑到速度，batch size也从64 扩大到256.
+
+test H :
+
+python translate.py \
+--data new_data_huggingface.tsv \
+--out runs/huggingface_16k \
+--vocab-size 16000 \
+--d-model 512 \
+--layers 6 \
+--batch-size 256 \
+--epochs 30 \
+--lr 3e-4 \
+--lr-warmup \
+--warmup-ratio 0.1 \
+--limit 0
+
+失败，不折腾了，f+clean_fin就是最后一版。

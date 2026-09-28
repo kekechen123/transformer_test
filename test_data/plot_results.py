@@ -31,10 +31,14 @@ EXPERIMENTS = [
     ("testF+ clean", "test_f+_clean_loss.csv", "600k干净", "3e-4", 64, 512, 6,
      "重复 F+ 并训练到第 28 轮，valid loss 停在约 1.26，长句效果仍不理想",
      "warmup 0.1 + cosine", "干净数据"),
+    ("f+clean fin", "f+clean_fin.csv", "600k最终清洗", "3e-4", 64, 512, 6,
+     "进一步清洗数据后重跑 30 轮，valid loss 最低约 1.31，末轮约 1.31",
+     "warmup 0.1 + cosine", "最终清洗数据"),
 ]
 COLORS = {"testA": "#2563eb", "testB": "#dc2626", "testC": "#9333ea",
           "testD": "#059669", "testE": "#ea580c", "testF": "#0891b2",
-          "testG": "#7c3aed", "testF+": "#16a34a", "testF+ clean": "#65a30d"}
+          "testG": "#7c3aed", "testF+": "#16a34a", "testF+ clean": "#65a30d",
+          "f+clean fin": "#be123c"}
 
 # Add schedule/data annotations to the entries above that predate the extra
 # metadata fields.  This keeps the configuration table easy to edit.
@@ -68,7 +72,7 @@ def write_summary(rows):
     lines = [
         "# Transformer 实验结果汇总",
         "",
-        "纳入 test_config.md 中全部 9 组实验：testA–testG、testF+、testF+ clean。",
+        "纳入 test_config.md 中全部 10 组实验：testA–testG、testF+、testF+ clean、f+clean fin。",
         "",
         "| 实验 | 数据量 | d-model | layers | lr | batch-size | epochs | schedule | 数据状态 | train 首/末 | valid 最优 | valid 末轮 | 平均每 epoch(s) |",
         "|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|",
@@ -115,17 +119,17 @@ def chart():
         datasets.append((name, data_rows))
     rows = summary()
     max_time = max(float(row["time_min"]) for _, data_rows in datasets for row in data_rows)
-    width, height = 1700, 930
-    left, top, panel_w, panel_h = 70, 125, 1050, 690
-    right = 1160
+    width, height = 2000, 1250
+    left, top, panel_w, panel_h = 70, 125, 1320, 650
+    right, side_w = 1430, 500
     parts = [
-        '<svg xmlns="http://www.w3.org/2000/svg" width="1700" height="930" viewBox="0 0 1700 930">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#f8fafc"/>',
-        '<style>text{font-family:Arial,"Noto Sans SC",sans-serif;fill:#0f172a}.title{font-size:30px;font-weight:700}.subtitle{font-size:15px;fill:#64748b}.panel{font-size:20px;font-weight:700}.axis{font-size:14px;fill:#334155}.tick{font-size:12px;fill:#64748b}.legend{font-size:14px;fill:#334155}.table{font-size:13px;fill:#334155}.tablehead{font-size:13px;font-weight:700;fill:#0f172a}.note{font-size:14px;fill:#475569}</style>',
-        '<text x="70" y="55" class="title">Transformer Loss 实验对比与参数汇总（testA–testG、testF+）</text>',
-        '<text x="70" y="84" class="subtitle">横轴：累计训练时间（分钟）　·　分段等高纵轴：1–2、2–11　·　仅显示 valid loss</text>',
+        '<style>text{font-family:Arial,"Noto Sans SC","Microsoft YaHei",sans-serif;fill:#0f172a}.title{font-size:30px;font-weight:700}.subtitle{font-size:16px;fill:#64748b}.panel{font-size:21px;font-weight:700}.axis{font-size:15px;fill:#334155}.tick{font-size:13px;fill:#64748b}.legend{font-size:15px;fill:#334155}.table{font-size:14px;fill:#334155}.tablehead{font-size:14px;font-weight:700;fill:#0f172a}.note{font-size:14px;fill:#475569}.small{font-size:13px;fill:#64748b}</style>',
+        '<text x="70" y="55" class="title">Transformer Loss 实验对比与参数汇总（全部 10 组）</text>',
+        '<text x="70" y="86" class="subtitle">横轴：累计训练时间（分钟） · 分段等高纵轴：1–2、2–11 · 曲线：valid loss</text>',
     ]
-    px, py, pw, ph = left + 78, top + 78, panel_w - 115, panel_h - 150
+    px, py, pw, ph = left + 82, top + 78, panel_w - 120, panel_h - 140
     parts.extend([f'<rect x="{left}" y="{top}" width="{panel_w}" height="{panel_h}" rx="12" fill="#fff" stroke="#dbe3ee"/>',
                   f'<text x="{left + 25}" y="{top + 38}" class="panel">Loss 曲线（分段等高纵轴）</text>'])
     # 纵轴刻度：1–2 区间细分，2–11 区间给出主要量级刻度。
@@ -161,32 +165,49 @@ def chart():
     for name, data_rows in datasets:
         color = COLORS[name]
         parts.append(f'<polyline points="{points(data_rows, "valid_loss", px, py, pw, ph, max_time)}" fill="none" stroke="{color}" stroke-width="3"/>')
-    # 右侧参数表。
-    table_x, table_y, table_w = right, top, width - right - 55
-    parts.extend([f'<rect x="{table_x}" y="{table_y}" width="{table_w}" height="{panel_h}" rx="12" fill="#fff" stroke="#dbe3ee"/>',
+    # 右侧独立放图例与结论，避免和参数表、曲线互相挤压。
+    parts.extend([f'<rect x="{right}" y="{top}" width="{side_w}" height="{panel_h}" rx="12" fill="#fff" stroke="#dbe3ee"/>',
+                  f'<text x="{right + 28}" y="{top + 40}" class="panel">实验图例</text>'])
+    for i, (name, _) in enumerate(datasets):
+        lx = right + 30 + (i % 2) * 225
+        ly = top + 88 + (i // 2) * 48
+        parts.append(f'<line x1="{lx}" y1="{ly}" x2="{lx + 34}" y2="{ly}" stroke="{COLORS[name]}" stroke-width="4"/>')
+        parts.append(f'<text x="{lx + 45}" y="{ly + 5}" class="legend">{html.escape(name)}</text>')
+    note_y = top + 370
+    parts.extend([
+        f'<line x1="{right + 25}" y1="{note_y - 28}" x2="{right + side_w - 25}" y2="{note_y - 28}" stroke="#e2e8f0"/>',
+        f'<text x="{right + 28}" y="{note_y}" class="panel">关键观察</text>',
+        f'<text x="{right + 28}" y="{note_y + 42}" class="note">• testC 在 512×6、lr 3e-4 下明显失稳</text>',
+        f'<text x="{right + 28}" y="{note_y + 78}" class="note">• testF 比 testG 收敛更快，cosine 衰减有效</text>',
+        f'<text x="{right + 28}" y="{note_y + 114}" class="note">• testF+ clean 最优 valid loss：1.268</text>',
+        f'<text x="{right + 28}" y="{note_y + 150}" class="note">• f+clean fin 最优 valid loss：1.309</text>',
+        f'<text x="{right + 28}" y="{note_y + 201}" class="small">注：test_f_clean.csv 与 test_f+_clean_loss.csv</text>',
+        f'<text x="{right + 28}" y="{note_y + 224}" class="small">数据相同，不作为额外实验重复绘制。</text>',
+    ])
+
+    # 参数表改为底部通栏；各列留足固定空间，消除文字重叠。
+    table_x, table_y, table_w, table_h = 70, 815, 1860, 365
+    parts.extend([f'<rect x="{table_x}" y="{table_y}" width="{table_w}" height="{table_h}" rx="12" fill="#fff" stroke="#dbe3ee"/>',
                   f'<text x="{table_x + 25}" y="{table_y + 38}" class="panel">实验参数与结果</text>'])
-    cols = [(table_x + 22, "实验"), (table_x + 105, "数据"), (table_x + 175, "d-model"),
-            (table_x + 245, "层数"), (table_x + 285, "lr"), (table_x + 340, "epoch"),
-            (table_x + 395, "valid 最优")]
-    header_y = table_y + 75
-    parts.append(f'<line x1="{table_x + 18}" y1="{header_y + 10}" x2="{table_x + table_w - 18}" y2="{header_y + 10}" stroke="#cbd5e1"/>')
+    cols = [(table_x + 25, "实验"), (table_x + 190, "数据"), (table_x + 390, "d-model"),
+            (table_x + 510, "层数"), (table_x + 600, "lr"), (table_x + 720, "batch"),
+            (table_x + 820, "epoch"), (table_x + 930, "valid 最优"),
+            (table_x + 1075, "valid 末轮"), (table_x + 1225, "训练策略"),
+            (table_x + 1510, "数据状态")]
+    header_y = table_y + 76
+    parts.append(f'<line x1="{table_x + 20}" y1="{header_y + 13}" x2="{table_x + table_w - 20}" y2="{header_y + 13}" stroke="#cbd5e1"/>')
     for x, label in cols:
         parts.append(f'<text x="{x}" y="{header_y}" class="tablehead">{label}</text>')
     for i, row in enumerate(rows):
-        y = header_y + 48 + i * 48
-        parts.append(f'<line x1="{table_x + 18}" y1="{y + 17}" x2="{table_x + table_w - 18}" y2="{y + 17}" stroke="#eef2f7"/>')
-        values = [row["name"], row["dataset"], str(row["d_model"]), str(row["layers"]), row["lr"], str(row["epochs"]), fmt(row["valid_best"])]
+        y = header_y + 39 + i * 26
+        if i % 2:
+            parts.append(f'<rect x="{table_x + 18}" y="{y - 18}" width="{table_w - 36}" height="26" fill="#f8fafc"/>')
+        values = [row["name"], row["dataset"], str(row["d_model"]), str(row["layers"]),
+                  row["lr"], str(row["batch"]), str(row["epochs"]), fmt(row["valid_best"]),
+                  fmt(row["valid_last"]), row["schedule"], row["data_status"]]
         for (x, _), value in zip(cols, values):
             parts.append(f'<text x="{x}" y="{y}" class="table">{html.escape(value)}</text>')
-    legend_y = top + panel_h + 38
-    for i, (name, _) in enumerate(datasets):
-        lx = left + (i % 5) * 205
-        ly = legend_y + (i // 5) * 24
-        parts.append(f'<line x1="{lx}" y1="{ly}" x2="{lx + 30}" y2="{ly}" stroke="{COLORS[name]}" stroke-width="3"/>')
-        parts.append(f'<text x="{lx + 38}" y="{ly + 5}" class="legend">{html.escape(name)}</text>')
-    parts += [#f'<line x1="{left + 720}" y1="{legend_y}" x2="{left + 750}" y2="{legend_y}" stroke="#475569" stroke-width="3"/>',
-              #f'<text x="{left + 758}" y="{legend_y + 5}" class="legend">valid loss</text>',
-              '<text x="70" y="875" class="note">testC：512×6、3e-4 明显失稳；testF vs testG：cosine 衰减带来更快下降；testF+ clean：干净数据训练至第 28 轮，valid loss 最低约 1.26。</text>',
+    parts += ['<text x="70" y="1220" class="small">数据来源：test_config.md 与 test_data/*.csv；时间按各 epoch seconds 累加。</text>',
               '</svg>']
     (ROOT / "training_loss_comparison.svg").write_text("\n".join(parts), encoding="utf-8")
 

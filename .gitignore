@@ -1,4 +1,12 @@
+# Dataset
 *.tsv
 *.csv
-tmp
-test_data/__pycache__/
+!parallel_wmt_600k_final.tsv
+
+# Temporary files
+tmp/
+run/
+
+# Python cache
+__pycache__/
+*.py[cod]
