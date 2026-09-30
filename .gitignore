@@ -1,7 +1,6 @@
 # Dataset
 *.tsv
 *.csv
-!parallel_wmt_600k_final.tsv
 
 # Temporary files
 tmp/
