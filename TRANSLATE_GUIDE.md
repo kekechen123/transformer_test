@@ -1,26 +1,34 @@
 # `translate.py` 学习指南：从 PyTorch 基础到 Transformer 翻译
 
-这份笔记按程序真实执行顺序讲解 `translate.py`。阅读时不要求提前学过
+这份笔记结合程序真实执行顺序讲解 `translate.py`。阅读时不要求提前学过
 PyTorch，但最好知道 Python 的函数、类、列表、字典和切片。
+
+全文分成三层：
+
+1. 第 1～2 节建立 Tensor、参数、梯度和反向传播的数学基础；
+2. 第 3～5 节解释数据怎样进入 Transformer，以及模型为什么能并行处理序列；
+3. 第 6～14 节对应完整训练、生成、优化和模型保存流程。
+
+其中 2.6～2.7 是数学细节较多的深入章节。第一次阅读如果暂时觉得公式密集，可以
+先读到 2.5，然后阅读第 3～6 节建立实际流程，再回来细看 2.6～2.7。
 
 ## 1. 先建立整体认识
 
 训练翻译模型，本质上是在反复做下面这件事：
 
 ```text
-中文字符串
-  ↓ SentencePiece 分词
-中文 token id
-  ↓ Encoder
-源句的上下文表示 memory
-  ↓ Decoder + 已知英文前缀
-下一个英文 token 的预测分数
-  ↓ 与正确答案比较，计算 loss
-  ↓ backward
-更新模型参数
+一个 batch 的多对中英文句子
+  ↓ SentencePiece 分词并补齐
+src [B,S]，tgt [B,T]
+  ↓ Encoder + Decoder；训练时提供真实目标前缀
+一次并行得到所有句子、所有目标位置的 logits [B,T-1,V]
+  ↓ 每个有效位置与正确 token 比较
+所有 token loss 取平均，得到一个 batch loss
+  ↓ backward 汇总全部有效位置的意见
+更新一次模型参数，然后处理下一个 batch
 ```
 
-推理时没有正确英文答案，流程变成：
+推理时没有正确英文答案，不能像训练时那样提前提供整句真实目标，因此流程变成：
 
 ```text
 BOS → 预测 I → 预测 love → 预测 you → 预测 EOS
@@ -28,6 +36,13 @@ BOS → 预测 I → 预测 love → 预测 you → 预测 EOS
 
 模型每次只预测“下一个 token”，然后把自己的预测接回输入，继续预测。这叫
 **自回归生成**。
+
+因此先记住全文最重要的一组区别：
+
+```text
+训练：知道正确目标句 → 所有目标位置并行预测 → 一个 batch 更新一次参数
+推理：不知道正确目标句 → 每次生成一个 token → 反复前向，但不反向、不更新参数
+```
 
 ## 2. PyTorch 中最重要的几个概念
 
@@ -67,7 +82,7 @@ x = torch.tensor([[2, 15, 39, 3]])
 | `B` | batch size，一批有多少样本 | 64 |
 | `S` | 源句补齐后的长度 | 35 |
 | `T` | 目标句补齐后的长度 | 42 |
-| `D` | 每个 token 的向量维度 | 512 |
+| `D` | 每个 token 的向量维度 | 256（当前默认值） |
 | `V` | 词表大小 | 8000 |
 
 一次训练中，主要张量的形状是：
@@ -423,6 +438,10 @@ PyTorch 不会真的创建一个超长 Python 列表，而是把每个参数对�
 该参数的 `.grad` 张量中；它的 shape 通常和参数本身完全相同。
 
 ### 2.7 loss 到底怎样算，又怎样影响原来的模型参数
+
+本节先用一个简化输出层解释数学链路。这里会提前出现 `hidden`、`W`、`logits` 等
+名称；暂时把它们理解成“上一层给出的向量”“输出层权重”和“词表分数”即可，
+第 4 节会再放回完整 Transformer，第 6～7 节会放回真实训练循环。
 
 这一节先纠正一个很容易出现、也非常关键的表述：
 
@@ -1018,8 +1037,8 @@ W       [V, D]
 logits  [V]
 ```
 
-例如 `D=512、V=8000` 时，可以想成 8000 个评分员，每个评分员用自己的一组
-512 个权重观察同一个隐藏向量。
+例如当前默认 `D=256、V=8000` 时，可以想成 8000 个评分员，每个评分员用自己的
+一组 256 个权重观察同一个隐藏向量。
 
 #### 一个输出 token 的 loss 怎样变成输出矩阵的每个梯度
 
@@ -1378,29 +1397,378 @@ pe[:, 1::2] = cos(...)
 `0::2` 表示偶数列，`1::2` 表示奇数列。不同维度采用不同频率，使每个位置得到
 独特且平滑变化的向量。
 
-### 4.3 Encoder
+### 4.3 Attention 的核心：每个 token 都生成 Q、K、V
 
-Encoder 读取整条源句，并通过多层 Self-Attention 建立各 token 之间的关系。
+Transformer 的特色不是普通矩阵乘法本身，而是让每个 token 根据当前内容，动态
+决定应该从哪些位置读取信息。这个过程通过 Query、Key、Value 完成，简称 Q、K、V。
+
+先假设一条序列经过 Embedding 和位置编码后得到：
 
 ```text
-源句 embedding [B, S, D]
-       ↓ Encoder
-memory         [B, S, D]
+X [B, L, D]
 ```
 
-`memory` 仍然为源句每个位置保存一个 D 维表示，但每个表示已经融合上下文。
+其中每个位置都有一个 `D` 维向量。Attention 使用三组不同的可训练参数，把同一个
+输入投影成三种角色：
 
-### 4.4 Decoder
+```text
+Q = XW_Q    # Query：我正在寻找什么信息
+K = XW_K    # Key：我这里包含什么、可用什么特征被匹配
+V = XW_V    # Value：如果关注我，实际取走什么信息
+```
 
-Decoder 中有两类关键注意力：
+这里的 `W_Q`、`W_K`、`W_V` 都是模型参数，会通过反向传播学习；Q、K、V 则是
+当前 batch 根据输入和这些参数临时计算出的中间 Tensor，不是长期保存的参数。
 
-1. 目标句 Self-Attention：观察已经出现的目标 token；
-2. Cross-Attention：观察 Encoder 生成的 `memory`，从源句提取信息。
+可以把一个位置想成正在查资料：
 
-Decoder 最后输出 `[B, T, D]`，再经 `nn.Linear(D, V)` 得到 `[B, T, V]`。
-每个位置的 V 个数是所有词表 token 的 logits。
+```text
+Query：我现在想查什么？
+Key：每份资料的索引标签是什么？
+Value：每份资料的实际内容是什么？
+```
 
-### 4.5 logit、softmax 与概率
+某个位置的 Query 会和所有允许访问位置的 Key 做点积：
+
+```text
+score(i,j) = q_i · k_j
+```
+
+`score(i,j)` 越大，表示第 `i` 个位置当前越应该关注第 `j` 个位置。一次性写成矩阵：
+
+```text
+scores = QKᵀ
+```
+
+然后除以 `√d_k`，加入 mask，再做 softmax：
+
+```text
+A = softmax(QKᵀ / √d_k + mask)
+```
+
+- 除以 `√d_k`：避免维度较大时点积绝对值过大，导致 softmax 过早变得极端；
+- mask：把禁止关注的位置变成近似负无穷，softmax 后概率接近 0；
+- `A`：注意力权重，每一行表示一个 Query 应怎样分配注意力。
+
+最后用注意力权重对所有 Value 加权求和：
+
+```text
+Attention(Q,K,V) = A V
+                 = softmax(QKᵀ / √d_k + mask)V
+```
+
+因此某个位置的新表示不再只包含自己，而是按当前任务动态混合了其他位置的信息。
+
+#### 一个极简的 QKV 例子
+
+假设某个 Query 对三个位置算出的缩放后分数是：
+
+```text
+与位置 1 的匹配分数：1.2
+与位置 2 的匹配分数：0.2
+与位置 3 的匹配分数：2.0
+```
+
+softmax 后可能得到：
+
+```text
+注意力权重：[0.28, 0.10, 0.62]
+```
+
+如果三个位置的 Value 是 `v₁、v₂、v₃`，那么当前位置读到的信息就是：
+
+```text
+context = 0.28v₁ + 0.10v₂ + 0.62v₃
+```
+
+注意力并不是硬选一个 token，而通常是把多个位置的信息按不同权重混合。下一层
+输入变化后，新的 Q、K、V 和注意力分配也会变化。
+
+### 4.4 Self-Attention 与 Cross-Attention 的区别
+
+Q、K、V 的公式相似，区别在于它们从哪里来。
+
+Self-Attention 中三者来自同一序列：
+
+```text
+Q = XW_Q
+K = XW_K
+V = XW_V
+```
+
+它表示序列内部各位置互相读取信息：
+
+- Encoder Self-Attention：源句 token 互相观察；
+- Decoder Self-Attention：目标前缀 token 互相观察，并受 causal mask 限制。
+
+Cross-Attention 中，Query 来自 Decoder 当前状态，Key 和 Value 来自 Encoder
+输出的 `memory`：
+
+```text
+Q = decoder_hidden W_Q
+K = memory W_K
+V = memory W_V
+```
+
+它表达的是：
+
+> Decoder 当前要生成目标句的这个位置时，应该从源句哪些位置取信息？
+
+例如生成英文 `apple` 时，Decoder 的 Query 可能与中文“苹果”位置的 Key 匹配较
+强，从对应 Value 中读取较多源句信息。这里的注意力关系不是人工规定，而是
+`W_Q、W_K、W_V` 在大量翻译样本中逐渐学习出来的。
+
+### 4.5 多头注意力：同时使用多套 QKV 观察不同关系
+
+如果只有一套 Q、K、V，就只有一种投影空间和一种注意力分配。多头注意力会把
+`D` 维隐藏空间分成 `H` 个头，每个头使用自己的一套 QKV 投影：
+
+```text
+head_h = Attention(XW_Q^h, XW_K^h, XW_V^h)
+```
+
+各头可以学习不同类型的关系，例如某些头可能更关注：
+
+- 临近词和局部短语；
+- 主语与谓语；
+- 指代关系；
+- 源语言与目标语言中的对齐位置；
+- 标点、句尾或长距离依赖。
+
+这只是便于理解的可能性，并不表示每个头一定能被稳定命名为某种语法功能。
+
+当前默认配置为（`d_model` 可通过命令行修改，头数在代码中固定为 4）：
+
+```python
+d_model = 256
+nhead = 4
+```
+
+所以每个头处理的维度是：
+
+```text
+d_head = D / H = 256 / 4 = 64
+```
+
+形状可以想成：
+
+```text
+输入 X                         [B, L, 256]
+Q、K、V 投影后拆成 4 个头      [B, 4, L, 64]
+Self-Attention 分数 QKᵀ         [B, 4, L, L]
+softmax 后的注意力权重 A         [B, 4, L, L]
+每个头执行 A×V 后的结果          [B, 4, L, 64]
+4 个头拼接                      [B, L, 256]
+再经过输出投影 W_O              [B, L, 256]
+```
+
+`[L,L]` 的含义是：这一层里，每个 Query 位置都对每个 Key 位置产生一个匹配
+分数。加上 batch 和多头维度后，就是 `[B,H,L,L]`。
+
+Cross-Attention 的目标长度和源句长度可能不同。若 Decoder 当前长度为 `L`、源句
+长度为 `S`：
+
+```text
+Decoder 的 Q      [B,4,L,64]
+memory 的 K、V    [B,4,S,64]
+匹配分数 QKᵀ      [B,4,L,S]
+注意力权重 A       [B,4,L,S]
+加权结果 A×V       [B,4,L,64]
+```
+
+所以 `[B,4,L,S]` 可以直接读作：batch 中每句话、每个头、每个目标位置，都对
+源句的 `S` 个位置分配一组注意力权重。
+
+完整形式为：
+
+```text
+MultiHead(Q,K,V)
+= Concat(head₁, head₂, head₃, head₄) W_O
+```
+
+这里“多头”主要是并行关系：同一层的多个头读取同一批位置，但使用不同参数和不同
+表示子空间；它们算完后拼接，再混合回一个 `D` 维向量。多头不会把序列长度变成
+四倍，也不会让每个 token 变成四个独立 token。
+
+概念上可以说每个头有自己的一套 `W_Q^h、W_K^h、W_V^h`。具体实现为了效率，
+PyTorch 可能把多个头的投影参数打包进较大的矩阵一次计算，再 reshape 成多个头；
+数学效果仍然等价于各头使用不同的投影分片。
+
+### 4.6 Attention 后为什么还要 FFN、残差连接和 LayerNorm
+
+一个 Transformer 层不只有 Attention。
+
+Attention 主要负责**位置之间交换信息**：一个 token 从其他位置取什么。随后每个
+位置还会独立通过前馈网络 FFN，对已经汇总的信息做非线性变换：
+
+```text
+FFN(x) = Linear₂(激活函数(Linear₁(x)))
+```
+
+当前默认配置中：
+
+```text
+D = 256
+dim_feedforward = 2D = 512
+
+[B,L,256] → Linear → [B,L,512]
+          → 激活和 Dropout
+          → Linear → [B,L,256]
+```
+
+同一个 FFN 参数会独立应用到所有 batch、所有序列位置。它不会在位置之间传递信息；
+位置之间的信息交换已经由 Attention 完成。
+
+每个 Attention 或 FFN 子层外还会有：
+
+```text
+残差连接：让子层输出与原输入相加
+LayerNorm：稳定各隐藏维度的尺度
+Dropout：训练时提供正则化
+```
+
+可以概括成：
+
+```text
+子层输出 = LayerNorm(输入 + Dropout(子层计算(输入)))
+```
+
+某些 Transformer 变体会把 LayerNorm 放在子层计算之前；无论具体先后，残差连接的
+核心作用都是为信息和梯度提供直接通路，使很多层堆叠时更容易训练。
+
+### 4.7 一层 Encoder 的计算顺序
+
+Encoder 读取源句。单层 Encoder 可以按下面的逻辑理解：
+
+```text
+输入 X [B,S,D]
+  ↓
+多头 Self-Attention
+  Q、K、V 都来自 X
+  使用 source padding mask
+  ↓
+残差连接 + LayerNorm
+  ↓
+逐位置 FFN：D → 2D → D
+  ↓
+残差连接 + LayerNorm
+  ↓
+本层输出 [B,S,D]
+```
+
+输出 shape 不变，但含义变了：每个源 token 的表示已经读取了其他源位置的信息，
+又经过了非线性特征变换。
+
+### 4.8 一层 Decoder 的计算顺序
+
+单层 Decoder 比 Encoder 多一个 Cross-Attention：
+
+```text
+目标输入 Y [B,L,D]
+  ↓
+1. 多头 masked Self-Attention
+   Q、K、V 都来自 Y
+   使用 target padding mask 和 causal mask
+  ↓
+残差连接 + LayerNorm
+  ↓
+2. 多头 Cross-Attention
+   Q 来自 Decoder 当前隐藏状态
+   K、V 来自 Encoder memory [B,S,D]
+   使用 source padding mask
+  ↓
+残差连接 + LayerNorm
+  ↓
+3. 逐位置 FFN：D → 2D → D
+  ↓
+残差连接 + LayerNorm
+  ↓
+本层输出 [B,L,D]
+```
+
+顺序很重要：Decoder 先让目标前缀内部交流，再拿着更新后的目标表示去源句 memory
+中查询相关信息，最后用 FFN 进一步加工每个位置的特征。
+
+### 4.9 多头与多层不是一回事
+
+这两个“多”很容易混淆：
+
+| 名称 | 关系 | 作用 |
+|---|---|---|
+| 多头 `nhead=4` | 同一 Attention 子层内大体并行 | 同时在 4 个表示子空间中建立注意力关系 |
+| 多层 `layers=3` | 上一层输出进入下一层，串行堆叠 | 反复读取、混合和加工信息，逐步形成更深表示 |
+
+当前模型默认有（`layers` 可通过命令行修改）：
+
+```text
+3 层 Encoder，每层 4 头 Self-Attention
+3 层 Decoder，每层有：
+  4 头 masked Self-Attention
+  4 头 Cross-Attention
+```
+
+不能简单说总共有一个“24 头 Attention”来替代它们，因为不同层收到的输入不同，
+参数也不同。第 2 层是在第 1 层已经加工过的表示上继续计算，第 3 层再读取第 2 层
+的结果。**头是在层内并行观察，层是在深度方向串行加工。**
+
+### 4.10 整个模型一次前向传播的总顺序
+
+把多头、多层、Encoder、Decoder 和输出层全部串起来，按当前默认参数，一次前向是：
+
+```text
+源句 token ids [B,S]
+  ↓ 共享 Embedding + 位置编码
+源句表示 [B,S,256]
+  ↓ Encoder 第 1 层：4 头 Self-Attention → FFN
+  ↓ Encoder 第 2 层：4 头 Self-Attention → FFN
+  ↓ Encoder 第 3 层：4 头 Self-Attention → FFN
+memory [B,S,256]
+
+目标前缀 token ids [B,L]
+  ↓ 同一个共享 Embedding + 位置编码
+目标表示 [B,L,256]
+  ↓ Decoder 第 1 层：
+      4 头 masked Self-Attention
+      → 4 头 Cross-Attention(memory)
+      → FFN
+  ↓ Decoder 第 2 层：同样顺序，但使用第 1 层输出
+  ↓ Decoder 第 3 层：同样顺序，但使用第 2 层输出
+Decoder hidden [B,L,256]
+  ↓ 输出 Linear：256 → V
+logits [B,L,V]
+```
+
+每个子层内部还有残差连接、LayerNorm 和 Dropout，为了突出主线没有在总图中重复
+画出。
+
+还要注意 Encoder 和 Decoder 的总体依赖关系：必须先把源句经过全部 Encoder 层
+得到 `memory`，Decoder 每一层才能通过 Cross-Attention 读取它。Decoder 不会在
+每一层重新运行 Encoder；同一份最终 `memory` 会提供给所有 Decoder 层。
+
+训练时 `L=T-1`，一次得到所有位置的 `[B,T-1,V]`；推理时 `L` 是当前前缀长度，
+当前实现会在每一步重新运行这个 Decoder 前缀，然后只取最后位置的 `[V]` 来选择
+下一个 token。
+
+### 4.11 多层堆叠时，反向传播怎样返回去
+
+正向传播按层从前往后：
+
+```text
+Embedding → Encoder 1 → 2 → 3 → Decoder 1 → 2 → 3 → Output → loss
+```
+
+反向传播则沿计算图大体反过来：
+
+```text
+loss → Output → Decoder 3 → 2 → 1 → Encoder 3 → 2 → 1 → Embedding
+```
+
+“大体”是因为残差连接、Decoder 到 memory 的 Cross-Attention 等会形成分支；
+PyTorch 会沿所有有效路径应用链式法则，并把同一参数或中间量收到的多路梯度相加。
+每一层都有自己独立的 QKV、输出投影、FFN 和 LayerNorm 参数，所以每层最终都会
+得到自己的 `.grad`，再由优化器在同一个 step 中统一更新。
+
+### 4.12 logit、softmax 与概率
 
 logit 是尚未归一化的分数，可以是任意实数：
 
@@ -1441,15 +1809,65 @@ False False False False
 
 第 0 个位置只能看位置 0；第 1 个位置只能看 0、1；依此类推。
 
-## 6. Teacher Forcing 与 loss
+Padding mask 解决“哪些位置只是补齐”，causal mask 解决“哪些真实位置属于未来”。
+有了这两类限制，下一节才能安全地把多句话、多个目标位置放在一次前向中并行计算。
 
-假设目标句 token 是：
+## 6. 训练为何整句并行，而推理必须逐 token 生成
+
+这是理解 Transformer 训练循环最关键的一节。最常见的误解是：既然翻译模型预测
+的是“下一个 token”，是不是每预测一个 token 就要前向、反向并更新一次参数？
+
+答案是：
+
+```text
+推理时确实逐 token 前向生成；
+训练时通常把所有已知目标位置并行计算，并按一个 batch 更新一次。
+```
+
+### 6.1 推理时：生成一个 token，再把它接回输入
+
+实际翻译时，模型只有中文源句，不知道正确英文答案。假设最终结果是
+`I love you`，生成过程只能逐步进行：
+
+```text
+第 1 次前向：[BOS]              → 预测 I
+第 2 次前向：[BOS, I]           → 预测 love
+第 3 次前向：[BOS, I, love]     → 预测 you
+第 4 次前向：[BOS, I, love, you]→ 预测 EOS
+```
+
+伪代码是：
+
+```python
+generated = [BOS]
+while True:
+    logits = model(src, generated)
+    next_token = logits[:, -1].argmax(dim=-1)
+    generated.append(next_token)
+    if next_token == EOS:
+        break
+```
+
+每一步都依赖上一步实际选出的 token，所以时间方向上不能一次把未知的未来全部算
+出来。推理时通常没有正确目标标签，不计算训练 loss，也不执行 `backward()` 和
+`optimizer.step()`；模型只使用已经学好的参数反复前向传播。
+
+### 6.2 训练时：正确目标句已经存在
+
+训练数据同时提供：
+
+```text
+源句：我爱你
+目标句：I love you
+```
+
+加入特殊 token 后，目标序列是：
 
 ```text
 [BOS, I, love, you, EOS]
 ```
 
-训练代码进行切片：
+代码把目标序列错开一位：
 
 ```python
 decoder_input = tgt[:, :-1]
@@ -1459,57 +1877,207 @@ labels = tgt[:, 1:]
 得到：
 
 ```text
-输入：[BOS, I,    love, you]
-标签：[I,   love, you,  EOS]
+Decoder 输入：[BOS, I,    love, you]
+正确标签：    [I,   love, you,  EOS]
 ```
 
-这叫 Teacher Forcing：训练时每个位置使用真实历史作为前缀，而不是使用模型刚才
-可能预测错误的结果。配合 causal mask，四个位置可以在一次前向中并行训练。
+它实际上组成了四道“根据已有前缀预测下一个 token”的题目：
 
-`cross_entropy` 衡量正确 token 得到的概率是否足够高。loss 越低通常越好，但：
+```text
+[BOS]                 → I
+[BOS, I]              → love
+[BOS, I, love]        → you
+[BOS, I, love, you]   → EOS
+```
 
-- train loss 下降、valid loss 上升：可能过拟合；
-- train 和 valid 都高：可能尚未学会、模型不足或数据有问题；
-- valid loss 较低不保证译文一定自然，仍需 BLEU/COMET 或人工样例检查。
+训练时每道题都使用**真实前缀**，而不是模型上一位置刚预测出的结果，这叫
+**Teacher Forcing**。正因为正确目标句已经存在，模型不必真的生成 `I` 后才能构造
+第二道题；四道题的输入可以提前放进同一个 Tensor。
 
-### 6.1 交叉熵究竟在惩罚什么
+### 6.3 Causal mask 让并行计算不等于偷看答案
 
-假设某个位置的正确 token 是 `love`，模型给三个候选的概率为：
+Decoder 虽然一次收到 `[BOS, I, love, you]`，但第 5 节介绍的 causal mask 会限制
+每个位置只能读取自己和左边的真实前缀：
+
+```text
+位置 1 只能看到：[BOS]
+位置 2 只能看到：[BOS, I]
+位置 3 只能看到：[BOS, I, love]
+位置 4 只能看到：[BOS, I, love, you]
+```
+
+因此在 GPU 上是一次矩阵并行计算，在逻辑上仍然等价于四道不能看到未来答案的
+“预测下一 token”任务。Transformer 的训练效率很大程度上就来自这种序列位置的
+并行能力。
+
+### 6.4 一次前向到底输出什么
+
+模型一次输出的不是一个 token，也不是一个 logits 向量，而是：
+
+> batch 中每句话的每个目标位置，各自得到一个长度为词表大小的 logits 向量。
+
+假设：
+
+```text
+B = 2       # batch 中有 2 句话
+T-1 = 4     # 每句话有 4 个待预测位置
+V = 8000    # 词表中有 8000 个 token
+```
+
+那么：
+
+```text
+logits.shape = [2, 4, 8000]
+```
+
+三个维度依次表示：
+
+```text
+[第几句话, 第几个目标位置, 词表中每个 token 的分数]
+```
+
+展开理解就是：
+
+```text
+句子 1：
+  位置 1 → 8000 个 logits，用来预测 I
+  位置 2 → 8000 个 logits，用来预测 love
+  位置 3 → 8000 个 logits，用来预测 you
+  位置 4 → 8000 个 logits，用来预测 EOS
+
+句子 2：
+  位置 1 → 8000 个 logits
+  位置 2 → 8000 个 logits
+  位置 3 → 8000 个 logits
+  位置 4 → 8000 个 logits
+```
+
+所以“模型预测下一个 token”描述的是**每个位置在做什么**；`[B,T-1,V]` 描述的
+则是训练时把大量这样的预测任务怎样一起计算。两种说法并不矛盾。
+
+### 6.5 每个位置有自己的 token loss
+
+每个有效目标位置都是一次从 `V` 个 token 中选择正确 token 的分类。假设某位置
+的正确答案是 `love`，模型概率为：
 
 ```text
 I: 0.10, love: 0.70, you: 0.20
 ```
 
-这个位置的交叉熵是 `-log(0.70)`，约为 `0.357`。如果模型只给正确答案 0.01，
-loss 就是 `-log(0.01)`，约为 `4.605`。因此它会强烈惩罚“对正确答案非常没信心”
-的预测。
-
-对 logits 求导后，有一个很有用的结论：
+该位置的交叉熵为：
 
 ```text
-某候选 token 的梯度 = 模型概率 - 是否为正确答案
+token_loss = -log(0.70) ≈ 0.357
 ```
 
-正确 token 对应的值是 `p - 1`，通常为负；其他 token 是 `p - 0`，通常为正。
-优化器沿负梯度更新后，会倾向于提高正确 token 的 logit、压低错误 token 的
-logit。这个信号再通过反向传播一路传回 Decoder、Encoder 和 Embedding。
+如果只给正确答案 `0.01` 的概率：
 
-### 6.2 一个 batch 为什么只有一个 loss
+```text
+token_loss = -log(0.01) ≈ 4.605
+```
 
-`logits` 的形状是 `[B, T-1, V]`，也就是说 batch 中每句话的每个有效目标位置，
-都是一次“从 V 个 token 中选正确 token”的分类。代码先展平：
+虽然交叉熵数值只读取正确 token 的概率，但这个概率是所有 logits 经过 softmax
+竞争出来的，所以反向时词表里的每个 logit 都会获得梯度。完整推导见 2.7。
+
+### 6.6 所有有效 token loss 汇总成一个 batch loss
+
+假设两句话各有四个有效预测位置，就会得到八个 token loss：
+
+```text
+句子 1：L₁₁  L₁₂  L₁₃  L₁₄
+句子 2：L₂₁  L₂₂  L₂₃  L₂₄
+```
+
+代码把 shape 展平，只是为了交给交叉熵接口：
 
 ```python
 logits.reshape(-1, logits.size(-1))  # [B*(T-1), V]
 labels.reshape(-1)                   # [B*(T-1)]
 ```
 
-`cross_entropy` 再忽略标签为 PAD 的位置，并默认对其余位置取平均，最终得到一个
-标量 loss。`backward()` 通常从这个标量出发，把所有有效 token 对参数的影响汇总
-起来。因此一个训练 step 是“根据整个 batch 的平均意见更新一次”，不是每个句子
-各更新一次。
+`ignore_index=PAD` 排除补齐位置，默认的 `reduction="mean"` 对其余有效位置取平均：
+
+```text
+batch_loss
+= (L₁₁ + L₁₂ + L₁₃ + L₁₄
+   + L₂₁ + L₂₂ + L₂₃ + L₂₄) / 8
+```
+
+最终得到一个标量 batch loss。它不是说 batch 里只有一道题，而是把所有题的错误
+程度汇总成一个可用于反向传播的总目标。
+
+### 6.7 为什么一个 batch 只 backward 和更新一次
+
+如果 batch loss 是 `N` 个有效 token loss 的平均值：
+
+```text
+L_batch = (L₁ + L₂ + ... + Lₙ) / N
+```
+
+那么对任意模型参数 `w`：
+
+```text
+∂L_batch/∂w
+= (1/N) × (∂L₁/∂w + ∂L₂/∂w + ... + ∂Lₙ/∂w)
+```
+
+因此一次 `batch_loss.backward()` 已经把 batch 中所有句子、所有有效位置对参数
+`w` 的意见汇总到 `w.grad`。随后一次 `optimizer.step()` 根据这份综合意见更新
+参数。
+
+可以把它想成：
+
+```text
+预测 I 的位置认为：    w 应该减小一些
+预测 love 的位置认为： w 应该增大一些
+预测 you 的位置认为：  w 应该减小更多
+其他句子的各位置：     也各自给出意见
+                 ↓ 求和并平均
+当前 batch 对 w 的最终梯度
+```
+
+理论上可以每个 token 更新一次，但通常不这样做，因为它会失去序列并行能力、重复
+大量相似计算、不能充分利用 GPU，而且单个 token 的梯度噪声很大。batch 更新通常
+更高效、更稳定。
+
+### 6.8 把训练与推理放在一起比较
+
+| 阶段 | 知道正确目标句 | 目标位置怎样计算 | 计算训练 loss | 反向并更新参数 |
+|---|---:|---|---:|---:|
+| 训练 | 是 | 整句、整个 batch 并行 | 是 | 是，每个 batch 一次 |
+| 验证 loss | 是 | 整句、整个 batch 并行 | 是 | 否 |
+| 实际翻译 | 否 | 逐 token 自回归前向 | 通常否 | 否 |
+
+最简洁的流程图是：
+
+```text
+训练：
+一个 batch 的多句话
+→ 所有目标位置并行输出 [B,T-1,V]
+→ 每个位置计算 token loss
+→ 有效 token loss 取平均
+→ backward 一次
+→ 更新参数一次
+
+推理：
+当前前缀
+→ 前向预测下一个 token
+→ 把预测接回前缀
+→ 再次前向
+→ 直到 EOS；全程不 backward
+```
+
+loss 越低通常越好，但还要结合验证集和实际译文判断：
+
+- train loss 下降、valid loss 上升：可能过拟合；
+- train 和 valid 都高：可能尚未学会、模型不足或数据有问题；
+- valid loss 较低不保证译文一定自然，仍需 BLEU/COMET 或人工样例检查。
 
 ## 7. 一次参数更新发生了什么
+
+第 6 节解释了为什么一个 batch 能同时产生许多 token 预测，并最终只汇总成一个
+batch loss。本节不再重复位置级数学，而是把这件事逐行对应到 `run_epoch()`：一个
+batch 从清梯度到更新参数究竟执行哪些操作。
 
 先把 `run_epoch()` 中一次训练 step 的真实顺序完整列出来：
 
@@ -1763,12 +2331,34 @@ the company said that the company said that ...
 
 第一次学习时，不建议从 `main()` 第一行一路硬读到底。推荐顺序：
 
-1. `encode` 和 `collate`：先理解文字如何成为 `[B, L]`；
-2. `Translator.embed`：理解 `[B, L] → [B, L, D]`；
-3. `Translator.forward/decode`：跟踪到 `[B, T, V]`；
-4. `run_epoch`：理解 Teacher Forcing、loss 和参数更新；
-5. `translate` 的 greedy 分支；
-6. 最后学习 Beam Search、混合精度、scheduler 和断点恢复。
+1. 先读第 1 节和 2.1～2.5，区分 Tensor、参数、loss、梯度和更新；
+2. 阅读 `encode`、`collate`，理解文字怎样成为 `src [B,S]` 和 `tgt [B,T]`；
+3. 阅读第 4 节和 `Translator.embed`、`forward/decode`，沿
+   `Embedding → QKV → 多头 Attention → 多层 Encoder/Decoder → logits` 跟踪
+   shape 到 `[B,T-1,V]`；
+4. 重点阅读第 5～6 节和 `run_epoch`，理解 causal mask、Teacher Forcing、训练
+   并行与 batch loss；
+5. 回到 2.6～2.7，细看交叉熵怎样得到 logits 梯度，又怎样传到每个参数；
+6. 阅读第 7～9 节，把 `zero_grad → forward → loss → backward → step` 与实际
+   优化代码对应起来；
+7. 阅读 `translate` 的 greedy 分支，理解推理为什么只能逐 token 自回归生成；
+8. 最后学习 Beam Search、混合精度、scheduler 和断点恢复。
+
+阅读时始终抓住下面这条 shape 主线：
+
+```text
+src [B,S]，tgt [B,T]
+→ decoder_input / labels [B,T-1]
+→ Embedding + 位置编码
+→ Encoder 多层 Self-Attention，得到 memory [B,S,D]
+→ Decoder 多层 masked Self-Attention + Cross-Attention
+→ hidden [B,T-1,D]
+→ logits [B,T-1,V]
+→ 每个 [V] 对应一个 token 分类任务
+→ 所有有效位置的 token loss 取平均
+→ 标量 batch loss
+→ 每个参数各自得到同 shape 的 .grad
+```
 
 调试时可以临时打印：
 
