@@ -1369,7 +1369,86 @@ PAD 只是占位，不属于句子内容。因此代码在三个地方忽略 PAD
 
 ## 4. 模型结构
 
-### 4.1 Embedding
+### 4.1 先看清两条数据流：Encoder 处理源句，Decoder 处理目标前缀
+
+这是一个 Encoder–Decoder Transformer。理解后面的 QKV 之前，必须先把源端和
+目标端分开，不能把两边都笼统称为“输入序列”。
+
+假设翻译样本是：
+
+```text
+源语言：我爱你
+目标语言：I love you
+```
+
+本项目的 `encode()` 同时给源句和目标句加入 BOS、EOS，因此实际 token 序列为：
+
+```text
+src：[BOS, 我, 爱, 你, EOS]          长度记作 S
+tgt：[BOS, I, love, you, EOS]        长度记作 T
+```
+
+两边虽然都有 BOS/EOS，但用途不完全相同：
+
+- 源端 BOS/EOS 是交给 Encoder 的句子边界标记；Encoder 不负责从 BOS 开始生成；
+- 目标端 BOS 是 Decoder 开始生成的起点；
+- 目标端 EOS 是 Decoder 要学习预测的结束标记。
+
+训练时，目标序列会错开一位：
+
+```text
+Decoder 输入 tgt_in：[BOS, I,    love, you]    长度 T-1
+正确标签 labels：   [I,   love, you,  EOS]    长度 T-1
+```
+
+整个模型的前向主线是：
+
+```text
+源句 src [B,S]
+  ↓ 源端 Embedding + 位置编码
+X_src [B,S,D]
+  ↓ 多层 Encoder
+memory [B,S,D]
+
+目标前缀 tgt_in [B,T-1]
+  ↓ 目标端 Embedding + 位置编码
+X_tgt [B,T-1,D]
+  ↓ 多层 Decoder；每层都会读取 memory
+decoder_hidden [B,T-1,D]
+  ↓ 输出 Linear：D → V
+logits [B,T-1,V]
+```
+
+后文使用这些固定符号：
+
+```text
+B：batch size
+S：源句补齐后的长度
+T：完整目标句补齐后的长度
+L：不区分源端或目标端时使用的通用序列长度
+D：d_model，每个 token 的隐藏向量维度
+H：Attention 头数
+d_head：每个头的维度，D/H
+V：词表大小
+```
+
+一个 Decoder 层中有两次不同的 Attention，而 Encoder 层中有一次：
+
+```text
+Encoder Self-Attention：
+Q、K、V 都来自源句表示
+
+Decoder masked Self-Attention：
+Q、K、V 都来自目标前缀表示，并禁止看未来位置
+
+Decoder Cross-Attention：
+Q 来自 Decoder；K、V 来自 Encoder memory
+```
+
+它们使用相同的 Attention 数学模板，但输入来源、序列长度和 mask 不同，而且各自
+拥有独立的参数。下面先从 token id 如何变成向量开始。
+
+### 4.2 Embedding：把每个 token id 查成一个可训练向量
 
 `nn.Embedding(V, D)` 可以理解成一张 `[V, D]` 的可训练表格。输入 token id 后，
 它取出对应行：
@@ -1463,7 +1542,23 @@ one_hot(token_id) [V] × E [V,D] = token_vector [D]
 一开始向量是随机的。训练过程中，有相似用法的 token 往往会逐渐学出具有相关性
 的向量。
 
-### 4.2 位置编码
+本项目只有一个 `self.embedding`，源句和目标前缀共用同一张 `[V,D]` 表：
+
+```text
+src [B,S]
+  ↓ 同一个 self.embedding
+src token vectors [B,S,D]
+
+tgt_in [B,L_tgt]
+  ↓ 同一个 self.embedding
+tgt token vectors [B,L_tgt,D]
+```
+
+这里的“共用”是指相同 token id 在源端和目标端查询同一行参数。由于本项目使用
+同一个 SentencePiece 词表，这样做是可行的。但 Encoder 和 Decoder 后面的
+Attention、FFN 等参数并不因此共享。
+
+### 4.3 位置编码：给向量加入位置信息
 
 Self-Attention 本身不会自动区分词序。若不加入位置信息，“我喜欢你”和“你喜欢
 我”对它而言可能过于相似。
@@ -1478,13 +1573,28 @@ pe[:, 1::2] = cos(...)
 `0::2` 表示偶数列，`1::2` 表示奇数列。不同维度采用不同频率，使每个位置得到
 独特且平滑变化的向量。
 
-### 4.3 Attention 的核心：每个 token 都生成 Q、K、V
+项目中的 `embed(ids)` 实际还包含缩放、相加和 Dropout：
+
+```text
+token vectors = Embedding(ids) × √D    [B,L,D]
+position      = pe[:L]                  [L,D]
+
+X = Dropout(token vectors + position)  [B,L,D]
+```
+
+位置编码 `[L,D]` 会沿 batch 维广播，因此 batch 中所有样本的第 0 个位置使用同一
+位置编码、第 1 个位置使用同一位置编码；不同 token 的内容仍由 Embedding 向量决定。
+
+### 4.4 Attention 通用计算模板：QK 决定关注谁，V 提供实际内容
 
 Transformer 的特色不是普通矩阵乘法本身，而是让每个 token 根据当前内容，动态
 决定应该从哪些位置读取信息。这个过程通过 Query、Key、Value 完成，简称 Q、K、V。
 
-下面暂时只看**单头 Self-Attention**，按真实执行顺序把整个过程走一遍。多头只是在
-这个流程外面增加“拆成多个头、分别计算、再拼回来”，将在 4.5 节说明。
+下面暂时只看**单头 Self-Attention 的数学模板**，按真实执行顺序把整个过程走一遍。
+这里的 `X [B,L,D]` 可以代表源端表示，也可以代表目标端表示，但只用于解释
+“Q、K、V 来自同一个 X”时怎样计算；4.5 节会分别代入 Encoder、Decoder 的真实
+张量名称和长度。多头只是在这个流程外面增加“拆成多个头、分别计算、再拼回来”，
+将在 4.6 节说明。
 
 完整流程先压缩成一行：
 
@@ -1513,7 +1623,9 @@ L：每条序列的 token 数
 D：每个 token 的向量维度，即 d_model
 ```
 
-其中 `X[b,l,:]` 表示第 `b` 条序列中第 `l` 个 token 的完整 `D` 维向量。
+其中 `X[b,l,:]` 表示第 `b` 个样本中第 `l` 个 token 的完整 `D` 维向量。本节后面
+所说的“同一条序列”，严格指固定某个 `b` 后的 `X[b,:,:] [L,D]`；不同 batch 样本
+之间不会互相计算 Attention。
 
 #### 第 2 步：从 X 生成三个 Q、K、V
 
@@ -1631,22 +1743,91 @@ Q [B,L,D]
 K [B,L,D]
 ```
 
-对每条序列，Q 中的每个位置都要和 K 中的每个位置做点积。为此把 K 的最后两个
-维度转置：
+这里不是把不同 batch 的句子互相相乘，也不是只让同一位置的 `q_i` 和 `k_i`
+相乘。真正做的是：
+
+> 在同一条序列内部，每个位置的 Query 都分别与这条序列中所有位置的 Key 做点积。
+
+固定第 `b` 条序列，取其中第 `i` 个位置的 Query：
 
 ```text
-Q                 [B,L,D]
-Kᵀ                [B,D,L]
-scores = Q × Kᵀ   [B,L,L]
+Q[b,i,:] = q_i    [1,D]
 ```
 
-矩阵乘法中间的 `D` 被消去，留下 `[L,L]`：
+它需要依次和这条序列里的所有 Key 相乘：
 
 ```text
-[L,D] × [D,L] = [L,L]
+q_i [1,D] × k_0ᵀ [D,1] → score(i,0) [1,1]
+q_i [1,D] × k_1ᵀ [D,1] → score(i,1) [1,1]
+...
+q_i [1,D] × k_{L-1}ᵀ [D,1] → score(i,L-1) [1,1]
 ```
 
-因此 `scores[b,i,j]` 表示：
+每次点积都得到一个数。例如：
+
+```text
+q_i = [q_i0, q_i1, ..., q_i(D-1)]
+k_j = [k_j0, k_j1, ..., k_j(D-1)]
+
+score(i,j)
+= q_i × k_jᵀ
+= q_i0 k_j0 + q_i1 k_j1 + ... + q_i(D-1) k_j(D-1)
+```
+
+所以 `score(i,j)` 表示“第 `i` 个 token 想找的信息”和“第 `j` 个 token 提供的
+匹配标签”有多吻合。
+
+把一条序列的所有 Query 作为矩阵的行：
+
+```text
+Q[b] [L,D]
+
+       D 个 Query 特征
+q_0  [ · · · · · ]
+q_1  [ · · · · · ]
+...  [           ]
+q_{L-1} [ · · · · · ]
+```
+
+K 原本也是 `[L,D]`，其中每一行是一个 `k_j`。为了让每个 Query 行与每个 Key 行
+做点积，要把 K 转置成 `[D,L]`，使每个 Key 变成一列：
+
+```text
+K[b]ᵀ [D,L]
+
+       k_0   k_1   ...   k_{L-1}
+       [ ·     ·           · ]
+       [ ·     ·           · ]
+       [ ·     ·           · ]
+```
+
+于是同一条序列中的矩阵乘法是：
+
+```text
+Q[b] [L,D] × K[b]ᵀ [D,L] = scores[b] [L,L]
+```
+
+矩阵只能在相邻的内侧维度相等时相乘。这里相邻的两个维度都是 `D`，因此把它们
+逐项相乘并求和，结果保留外侧的 `L` 和 `L`：
+
+```text
+       [L,D] × [D,L] = [L,L]
+          └── D ──┘
+          相乘并求和
+```
+
+batch 维 `B` 不参加点积。PyTorch 相当于对每个 `b` 分别执行一次上述矩阵乘法：
+
+```text
+scores[0] = Q[0] × K[0]ᵀ    [L,L]
+scores[1] = Q[1] × K[1]ᵀ    [L,L]
+...
+
+合在一起：
+Q [B,L,D] × Kᵀ [B,D,L] → scores [B,L,L]
+```
+
+因此 `scores[b,i,j]` 精确表示：
 
 > 第 `b` 条序列中，第 `i` 个 token 的 Query 与第 `j` 个 token 的 Key 有多匹配。
 
@@ -1664,9 +1845,12 @@ Query token 2      s20      s21      s22
 
 每一行属于一个 Query，表示这个位置对整条序列所有 Key 的匹配分数。
 
+注意，到这一步还没有使用 `V`。Q 和 K 只负责算出“应该关注谁”；V 会在这些
+匹配分数变成注意力权重以后，作为真正被读取和混合的内容。
+
 #### 第 4 步：缩放、mask 和 softmax，得到注意力权重
 
-先把分数除以 `√D`。在多头情况下实际除以 `√d_head`：
+先把分数除以 Key/Query 的特征维度平方根。当前单头模板中该维度是 `D`，所以：
 
 ```text
 scaled_scores = scores / √D
@@ -1684,6 +1868,9 @@ mask 会把禁止关注的位置设成负无穷或一个非常大的负数：
 
 - padding mask：不读取 PAD；
 - causal mask：Decoder 当前位置不能偷看未来 token。
+
+公式写成 `scores + mask` 是为了表达效果。代码传入的 mask 可以是布尔张量；其中
+`True` 表示禁止关注，Transformer 会在 softmax 前把对应分数按负无穷处理。
 
 最后在每一行的 Key 维度上做 softmax：
 
@@ -1711,6 +1898,21 @@ softmax 后可能得到：
 
 这表示当前位置将从三个 Value 中分别读取约 28%、10% 和 62% 的信息。
 
+因此 `[B,L,L]` 不会直接作为 Attention 的最终输出。它先经历：
+
+```text
+原始匹配分数 scores [B,L,L]
+        ↓ 除以 √D（多头时每个头除以 √d_head）
+缩放分数
+        ↓ 加 mask，禁止读取 PAD 或未来位置
+masked scores
+        ↓ 每一行分别做 softmax
+注意力权重 A [B,L,L]
+```
+
+处理后，`A[b,i,j]` 不再只是任意大小的匹配分数，而是一个通常位于 0 到 1 之间的
+权重，表示第 `i` 个位置应该从第 `j` 个 Value 中读取多大比例的信息。
+
 #### 第 5 步：注意力权重 A 乘 V，混合各位置的信息
 
 现在已有：
@@ -1728,14 +1930,47 @@ C = A × V
 [B,L,L] × [B,L,D] → [B,L,D]
 ```
 
-中间用于求和的维度是“被关注的位置 `L`”，最后保留：
+这一次仍然是每个 batch 分开计算：
+
+```text
+C[b] = A[b] × V[b]
+
+A[b] [L,L] × V[b] [L,D] = C[b] [L,D]
+```
+
+矩阵相乘时，相邻的内侧维度都是 `L`：
+
+```text
+[L,L] × [L,D] = [L,D]
+   └── L ──┘
+   相乘并求和
+```
+
+这里被消去的 `L` 表示“遍历所有可被关注的 token 位置”。结果保留：
 
 ```text
 每个 Query 位置 L × 每个 Value 的特征维 D
 = [L,D]
 ```
 
-单独看第 `i` 个 Query 位置：
+具体来说，A 的第 `i` 行：
+
+```text
+A[b,i,:] = [a_i0, a_i1, ..., a_i(L-1)]    [1,L]
+```
+
+要与 V 的所有行相乘。V 的每一行是对应位置真正提供的 `D` 维内容：
+
+```text
+V[b] [L,D]
+
+v_0 [D]
+v_1 [D]
+...
+v_{L-1} [D]
+```
+
+因此第 `i` 个位置的新向量为：
 
 ```text
 C[b,i,:]
@@ -1751,8 +1986,25 @@ C[b,i,:]
 context = 0.28v₀ + 0.10v₁ + 0.62v₂
 ```
 
-所以 Attention 不是硬选一个 token，而是按照注意力权重对多个 Value 向量加权求和。
-最终每个位置得到一个新的 `D` 维表示，其中混合了它所关注位置的信息。
+这里的乘法可以直接读作：
+
+```text
+第 i 个 Query 对各位置的注意力权重 [1,L]
+                 ×
+各位置真正提供的 Value 内容       [L,D]
+                 =
+第 i 个位置读取到的新内容          [1,D]
+```
+
+所以 Q、K、V 的分工是：
+
+```text
+Q 和 K 相乘：决定每个位置应该关注谁，产生 A [B,L,L]
+A 和 V 相乘：按关注比例读取实际内容，产生 C [B,L,D]
+```
+
+Attention 不是硬选一个 token，而是按照权重对多个 Value 向量加权求和。最终每个
+位置重新得到一个 `D` 维向量，其中混合了它关注的其他位置的信息。
 
 #### 第 6 步：经过输出投影 W_O
 
@@ -1849,41 +2101,298 @@ W_O.grad：所有相关 loss 对 W_O 的综合梯度，shape [D,D]
 
 这里是分别汇总每个参数收到的梯度，不是把 Q、K、V 三组参数的梯度混在一起。
 
-### 4.4 Self-Attention 与 Cross-Attention 的区别
+### 4.5 把通用模板分别代入 Encoder 和 Decoder
 
-Q、K、V 的公式相似，区别在于它们从哪里来。
-
-Self-Attention 中三者来自同一序列：
+上一节中的计算公式不变：
 
 ```text
-Q = XW_Q
-K = XW_K
-V = XW_V
+Q = query_input W_Q
+K = key_input W_K
+V = value_input W_V
+
+A = softmax(QKᵀ / √d + mask)
+C = AV
+Y = CW_O
 ```
 
-它表示序列内部各位置互相读取信息：
+真正需要区分的是 `query_input、key_input、value_input` 分别来自哪里，以及
+Query 长度和 Key/Value 长度各是多少。
 
-- Encoder Self-Attention：源句 token 互相观察；
-- Decoder Self-Attention：目标前缀 token 互相观察，并受 causal mask 限制。
+#### 4.5.1 Encoder Self-Attention：源句内部互相读取
 
-Cross-Attention 中，Query 来自 Decoder 当前状态，Key 和 Value 来自 Encoder
-输出的 `memory`：
+假设本项目的一条源句是：
 
 ```text
-Q = decoder_hidden W_Q
-K = memory W_K
-V = memory W_V
+src：[BOS, 我, 爱, 你, EOS]
 ```
 
-它表达的是：
+整个 batch 的源句 token id 为：
 
-> Decoder 当前要生成目标句的这个位置时，应该从源句哪些位置取信息？
+```text
+src [B,S]
+```
 
-例如生成英文 `apple` 时，Decoder 的 Query 可能与中文“苹果”位置的 Key 匹配较
-强，从对应 Value 中读取较多源句信息。这里的注意力关系不是人工规定，而是
-`W_Q、W_K、W_V` 在大量翻译样本中逐渐学习出来的。
+经过 Embedding 和位置编码：
 
-### 4.5 多头注意力：同时使用多套 QKV 观察不同关系
+```text
+X_src = embed(src)    [B,S,D]
+```
+
+Encoder Self-Attention 的 Q、K、V 全部来自源句表示 `X_src`，但经过三组不同参数：
+
+```text
+Q_src = X_src W_Q^enc    [B,S,D]
+K_src = X_src W_K^enc    [B,S,D]
+V_src = X_src W_V^enc    [B,S,D]
+```
+
+固定 batch 中第 `b` 条源句：
+
+```text
+Q_src[b]    [S,D]
+K_src[b]ᵀ  [D,S]
+```
+
+每个源位置的 Query 都和所有源位置的 Key 做点积：
+
+```text
+scores_enc[b]
+= Q_src[b] K_src[b]ᵀ
+
+[S,D] × [D,S] → [S,S]
+```
+
+例如“爱”位置的 Query 会分别和：
+
+```text
+BOS、我、爱、你、EOS
+```
+
+五个位置的 Key 做点积，得到五个匹配分数。所有源位置一起计算后，得到：
+
+```text
+scores_enc [B,S,S]
+```
+
+Encoder 不使用 causal mask，因为理解源句时每个有效位置都可以观察整句；这里只用
+source padding mask 屏蔽 PAD：
+
+```text
+A_enc = softmax(scores_enc / √d_head + source_padding_mask)
+        [B,S,S]             # 单头写法
+```
+
+随后注意力权重读取源端 Value：
+
+```text
+C_enc = A_enc V_src
+
+[B,S,S] × [B,S,D] → [B,S,D]
+```
+
+以“爱”位置为例：
+
+```text
+C_enc[b,爱,:]
+= a_爱,BOS V_BOS
++ a_爱,我   V_我
++ a_爱,爱   V_爱
++ a_爱,你   V_你
++ a_爱,EOS V_EOS
+```
+
+因此 Encoder Self-Attention 的作用是让每个源 token 结合整个源句的信息。经过
+输出投影、残差、LayerNorm 和 FFN，并堆叠所有 Encoder 层后得到：
+
+```text
+memory [B,S,D]
+```
+
+`memory` 的每一行仍对应一个源句位置，但已经是结合上下文后的表示。
+
+#### 4.5.2 Decoder masked Self-Attention：目标前缀内部交流，但不能看未来
+
+训练时完整目标句为：
+
+```text
+tgt：[BOS, I, love, you, EOS]
+```
+
+送入 Decoder 的目标前缀是：
+
+```text
+tgt_in：[BOS, I, love, you]
+```
+
+为了简化本节符号，记目标前缀长度为 `L_tgt=T-1`：
+
+```text
+tgt_in [B,L_tgt]
+X_tgt = embed(tgt_in)    [B,L_tgt,D]
+```
+
+Decoder Self-Attention 的 Q、K、V 都来自目标端表示：
+
+```text
+Q_self = X_tgt W_Q^self    [B,L_tgt,D]
+K_self = X_tgt W_K^self    [B,L_tgt,D]
+V_self = X_tgt W_V^self    [B,L_tgt,D]
+```
+
+先计算所有目标位置两两之间的匹配分数：
+
+```text
+scores_self
+= Q_self K_selfᵀ
+
+[B,L_tgt,D] × [B,D,L_tgt]
+→ [B,L_tgt,L_tgt]
+```
+
+如果不加限制，`BOS` 位置也能看到后面的 `I、love、you`，这会泄露训练答案。因此
+必须加入 causal mask，把未来位置的分数屏蔽：
+
+```text
+允许看到的位置：
+
+BOS  → BOS
+I    → BOS、I
+love → BOS、I、love
+you  → BOS、I、love、you
+```
+
+对应的遮罩形状是 `[L_tgt,L_tgt]`，概念上为：
+
+```text
+             Key 位置
+           BOS    I    love   you
+Query BOS   可见   屏蔽  屏蔽   屏蔽
+      I     可见   可见  屏蔽   屏蔽
+      love  可见   可见  可见   屏蔽
+      you   可见   可见  可见   可见
+```
+
+同时还用 target padding mask 屏蔽目标端 PAD：
+
+```text
+A_self
+= softmax(scores_self / √d_head
+          + causal_mask
+          + target_padding_mask)
+  [B,L_tgt,L_tgt]
+```
+
+然后读取目标端自己的 Value：
+
+```text
+C_self = A_self V_self
+
+[B,L_tgt,L_tgt] × [B,L_tgt,D]
+→ [B,L_tgt,D]
+```
+
+因此 `C_self` 中每个目标位置只混合自己和之前目标 token 的信息。它经过输出投影、
+残差和 LayerNorm 后，形成 Decoder 接下来查询源句所使用的隐藏状态，记作：
+
+```text
+H_self [B,L_tgt,D]
+```
+
+#### 4.5.3 Decoder Cross-Attention：目标位置查询 Encoder memory
+
+Cross-Attention 连接 Encoder 和 Decoder。这里三者不再来自同一个张量：
+
+```text
+Query：来自 Decoder masked Self-Attention 之后的 H_self
+Key：  来自 Encoder 最终输出 memory
+Value：来自 Encoder 最终输出 memory
+```
+
+具体投影为：
+
+```text
+Q_cross = H_self W_Q^cross    [B,L_tgt,D]
+K_cross = memory W_K^cross    [B,S,D]
+V_cross = memory W_V^cross    [B,S,D]
+```
+
+注意这里的长度不同：
+
+```text
+Q 有 L_tgt 个目标位置
+K、V 有 S 个源句位置
+```
+
+固定第 `b` 个样本，矩阵乘法是：
+
+```text
+Q_cross[b]    [L_tgt,D]
+K_cross[b]ᵀ  [D,S]
+
+scores_cross[b]
+= Q_cross[b] K_cross[b]ᵀ
+
+[L_tgt,D] × [D,S] → [L_tgt,S]
+```
+
+整个 batch 得到：
+
+```text
+scores_cross [B,L_tgt,S]
+```
+
+其中：
+
+```text
+scores_cross[b,i,j]
+```
+
+表示第 `b` 个样本中，第 `i` 个目标位置应该多关注第 `j` 个源句位置。比如目标端
+准备形成 `love` 的表示时，它的 Query 可能和源端“爱”位置的 Key 最匹配。
+
+Cross-Attention 不需要 causal mask，因为 Encoder memory 是已经完整给出的源句，
+但要使用 source padding mask，不允许读取源端 PAD：
+
+```text
+A_cross
+= softmax(scores_cross / √d_head + source_padding_mask)
+  [B,L_tgt,S]
+```
+
+随后用这组权重读取源端 Value：
+
+```text
+C_cross = A_cross V_cross
+
+[B,L_tgt,S] × [B,S,D]
+→ [B,L_tgt,D]
+```
+
+单独看第 `i` 个目标位置：
+
+```text
+C_cross[b,i,:]
+= A_cross[b,i,0] V_cross[b,0,:]
++ A_cross[b,i,1] V_cross[b,1,:]
++ ...
++ A_cross[b,i,S-1] V_cross[b,S-1,:]
+```
+
+这一步的含义是：目标位置先用 Q/K 算出对源句各位置的关注比例，再按比例混合
+源句各位置真正提供的 Value 内容。
+
+三种 Attention 可以用一张表区分：
+
+| Attention | Q 来自 | K、V 来自 | 分数 shape（单头） | mask |
+|---|---|---|---|---|
+| Encoder Self-Attention | 源句表示 `[B,S,D]` | 源句表示 `[B,S,D]` | `[B,S,S]` | source PAD |
+| Decoder masked Self-Attention | 目标前缀 `[B,L_tgt,D]` | 目标前缀 `[B,L_tgt,D]` | `[B,L_tgt,L_tgt]` | target PAD + causal |
+| Decoder Cross-Attention | Decoder 状态 `[B,L_tgt,D]` | Encoder memory `[B,S,D]` | `[B,L_tgt,S]` | source PAD |
+
+还要注意，这三个 Attention 模块各自拥有独立的 `W_Q、W_K、W_V、W_O`，并不是
+整个模型共用同一套参数。
+
+### 4.6 多头注意力：把 D 维拆给多个头分别计算
 
 如果只有一套 Q、K、V，就只有一种投影空间和一种注意力分配。多头注意力会把
 `D` 维隐藏空间分成 `H` 个头，每个头使用自己的一套 QKV 投影：
@@ -1959,7 +2468,7 @@ MultiHead(Q,K,V)
 PyTorch 可能把多个头的投影参数打包进较大的矩阵一次计算，再 reshape 成多个头；
 数学效果仍然等价于各头使用不同的投影分片。
 
-### 4.6 Attention 后为什么还要 FFN、残差连接和 LayerNorm
+### 4.7 Attention 后为什么还要 FFN、残差连接和 LayerNorm
 
 一个 Transformer 层不只有 Attention。
 
@@ -2001,7 +2510,7 @@ Dropout：训练时提供正则化
 某些 Transformer 变体会把 LayerNorm 放在子层计算之前；无论具体先后，残差连接的
 核心作用都是为信息和梯度提供直接通路，使很多层堆叠时更容易训练。
 
-### 4.7 一层 Encoder 的计算顺序
+### 4.8 一层 Encoder 的计算顺序
 
 Encoder 读取源句。单层 Encoder 可以按下面的逻辑理解：
 
@@ -2024,7 +2533,7 @@ Encoder 读取源句。单层 Encoder 可以按下面的逻辑理解：
 输出 shape 不变，但含义变了：每个源 token 的表示已经读取了其他源位置的信息，
 又经过了非线性特征变换。
 
-### 4.8 一层 Decoder 的计算顺序
+### 4.9 一层 Decoder 的计算顺序
 
 单层 Decoder 比 Encoder 多一个 Cross-Attention：
 
@@ -2054,7 +2563,7 @@ Encoder 读取源句。单层 Encoder 可以按下面的逻辑理解：
 顺序很重要：Decoder 先让目标前缀内部交流，再拿着更新后的目标表示去源句 memory
 中查询相关信息，最后用 FFN 进一步加工每个位置的特征。
 
-### 4.9 多头与多层不是一回事
+### 4.10 多头与多层不是一回事
 
 这两个“多”很容易混淆：
 
@@ -2076,31 +2585,38 @@ Encoder 读取源句。单层 Encoder 可以按下面的逻辑理解：
 参数也不同。第 2 层是在第 1 层已经加工过的表示上继续计算，第 3 层再读取第 2 层
 的结果。**头是在层内并行观察，层是在深度方向串行加工。**
 
-### 4.10 整个模型一次前向传播的总顺序
+### 4.11 整个模型一次前向传播的总顺序
 
 把多头、多层、Encoder、Decoder 和输出层全部串起来，按当前默认参数，一次前向是：
 
 ```text
-源句 token ids [B,S]
-  ↓ 共享 Embedding + 位置编码
+forward(src, tgt_in)
+
+源句 token ids src [B,S]
+  ↓ model.embed(src)：共享 Embedding × √D + 位置编码 + Dropout
 源句表示 [B,S,256]
+  ↓ transformer.encoder(..., src_key_padding_mask=src_pad)
   ↓ Encoder 第 1 层：4 头 Self-Attention → FFN
   ↓ Encoder 第 2 层：4 头 Self-Attention → FFN
   ↓ Encoder 第 3 层：4 头 Self-Attention → FFN
 memory [B,S,256]
 
-目标前缀 token ids [B,L]
-  ↓ 同一个共享 Embedding + 位置编码
-目标表示 [B,L,256]
+目标前缀 token ids tgt_in [B,L_tgt]
+  ↓ model.embed(tgt_in)：同一个 Embedding × √D + 位置编码 + Dropout
+目标表示 [B,L_tgt,256]
+  ↓ transformer.decoder(..., memory,
+                         tgt_mask=causal,
+                         tgt_key_padding_mask=tgt_pad,
+                         memory_key_padding_mask=src_pad)
   ↓ Decoder 第 1 层：
       4 头 masked Self-Attention
       → 4 头 Cross-Attention(memory)
       → FFN
   ↓ Decoder 第 2 层：同样顺序，但使用第 1 层输出
   ↓ Decoder 第 3 层：同样顺序，但使用第 2 层输出
-Decoder hidden [B,L,256]
+Decoder hidden [B,L_tgt,256]
   ↓ 输出 Linear：256 → V
-logits [B,L,V]
+logits [B,L_tgt,V]
 ```
 
 每个子层内部还有残差连接、LayerNorm 和 Dropout，为了突出主线没有在总图中重复
@@ -2110,11 +2626,11 @@ logits [B,L,V]
 得到 `memory`，Decoder 每一层才能通过 Cross-Attention 读取它。Decoder 不会在
 每一层重新运行 Encoder；同一份最终 `memory` 会提供给所有 Decoder 层。
 
-训练时 `L=T-1`，一次得到所有位置的 `[B,T-1,V]`；推理时 `L` 是当前前缀长度，
+训练时 `L_tgt=T-1`，一次得到所有位置的 `[B,T-1,V]`；推理时 `L_tgt` 是当前前缀长度，
 当前实现会在每一步重新运行这个 Decoder 前缀，然后只取最后位置的 `[V]` 来选择
 下一个 token。
 
-### 4.11 多层堆叠时，反向传播怎样返回去
+### 4.12 多层堆叠时，反向传播怎样返回去
 
 正向传播按层从前往后：
 
@@ -2133,7 +2649,7 @@ PyTorch 会沿所有有效路径应用链式法则，并把同一参数或中间
 每一层都有自己独立的 QKV、输出投影、FFN 和 LayerNorm 参数，所以每层最终都会
 得到自己的 `.grad`，再由优化器在同一个 step 中统一更新。
 
-### 4.12 logit、softmax 与概率
+### 4.13 logit、softmax 与概率
 
 logit 是尚未归一化的分数，可以是任意实数：
 
